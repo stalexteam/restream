@@ -27,10 +27,10 @@ connection to the VPS is down.
 - **Automatic timeout.** If the connection doesn't come back within a
   configurable window (30 minutes by default), the Twitch broadcast
   ends on its own instead of looping the backup video forever.
-- **No Docker, no heavy dependencies.** A single Go binary
-  ([MediaMTX](https://github.com/bluenviron/mediamtx)) for RTMP
-  ingest, and a stdlib-only Python controller — nothing to build,
-  nothing to containerize.
+- **No Docker, no heavy dependencies.** `ffmpeg` for encoding/relaying,
+  a single Go binary ([MediaMTX](https://github.com/bluenviron/mediamtx))
+  for RTMP ingest, and a stdlib-only Python controller — nothing to
+  build, nothing to containerize.
 
 This project intentionally does *not* try to be a general-purpose
 restreaming platform (no multi-destination fan-out, no transcoding
@@ -63,9 +63,9 @@ cd restream
 bash install.sh
 ```
 
-This installs `ffmpeg` and `python3`, downloads the MediaMTX binary,
-and generates two config files with random passwords: `mediamtx.yml`
-and `controller/config.json`. At the end it prints:
+This installs `ffmpeg`, `python3`, and the MediaMTX binary, and
+generates two config files with random passwords: `mediamtx.yml` and
+`controller/config.json`. At the end it prints:
 
 - the RTMP login/password for OBS,
 - the URL and token for the OBS script `obs-plugin/obs_graceful_stop.py`.
