@@ -1,0 +1,75 @@
+# MediaMTX configuration for the restream-controller project.
+# This is a TEMPLATE -- install.sh fills in real passwords and creates
+# a working mediamtx.yml from it. The placeholders below (in "pass:"
+# fields) are replaced automatically on every install.sh run (fresh
+# passwords are generated each time).
+
+logLevel: info
+logDestinations: [stdout]
+
+# How long to wait for data from OBS before considering the connection
+# dead and closing it (even if the TCP socket itself is still open --
+# a "silent" drop: the network is gone, but the connection hasn't
+# formally closed yet). This closing is exactly what triggers
+# runOnUnavailable below -> the backup video.
+#
+# WARNING: this same timeout also applies to connection setup (RTMP
+# handshake + first frame from the encoder), not just to a steady
+# stream. Too low a value prevents connecting at all, not just "detects
+# a drop faster". Verified empirically on a clean localhost with zero
+# network delay: 1000ms and 1500ms consistently failed to connect at
+# all (0/5 successful attempts); 2000ms -- consistently 5/5, which is
+# the current value. On a real network (OBS -> VPS over the internet)
+# an even bigger margin is needed -- don't go below 2000ms without
+# re-testing on a real setup.
+readTimeout: 2000ms
+
+# We don't need MediaMTX's control API -- the controller manages the
+# ffmpeg processes directly, so it's disabled to avoid an unnecessary
+# attack surface.
+api: false
+
+# RTMP is the only protocol we need (OBS publishes over RTMP).
+rtmp: true
+rtmpAddress: :1935
+# Other protocols are disabled -- not used by this project.
+rtsp: no
+hls: no
+webrtc: no
+srt: no
+
+# --- Authentication ---
+# By default MediaMTX allows anonymous publishing to anything -- this
+# is intentionally disabled. Only two explicitly defined users remain.
+authMethod: internal
+authInternalUsers:
+  # OBS publishes its stream here. The password is only valid for this path.
+  - user: obs
+    pass: __OBS_PASS__
+    ips: []
+    permissions:
+      - action: publish
+        path: live/main
+
+  # Internal user for the controller's own ffmpeg process (relay reads
+  # live/main). Restricted to localhost only -- this account can't be
+  # used from the internet even if the password is known. Switching
+  # between live and backup happens outside MediaMTX (inside the
+  # controller itself), so there's only one path and one permission here.
+  - user: internal
+    pass: __INTERNAL_PASS__
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: read
+        path: live/main
+
+# --- Paths ---
+paths:
+  live/main:
+    # MediaMTX calls these hooks when the publisher (OBS) appears or
+    # disappears. The hooks themselves don't decide anything -- they
+    # just notify the controller, and all the logic (fallback video,
+    # timeout, graceful stop) lives in controller.py.
+    runOnAvailable: curl -s -X POST http://127.0.0.1:8790/hooks/available
+    runOnAvailableRestart: false
+    runOnUnavailable: curl -s -X POST http://127.0.0.1:8790/hooks/unavailable

@@ -1,0 +1,26 @@
+{
+  "_comment": "This is an example config. install.sh creates a working controller/config.json with passwords filled in. The twitch_url and backup_file fields need to be edited manually.",
+
+  "listen_host": "0.0.0.0",
+  "listen_port": 8790,
+
+  "obs_webhook_token": "__OBS_WEBHOOK_TOKEN__",
+
+  "mediamtx_rtmp_host": "127.0.0.1",
+  "mediamtx_rtmp_port": 1935,
+  "live_path": "live/main",
+  "internal_user": "internal",
+  "internal_pass": "__INTERNAL_PASS__",
+
+  "backup_file": "__BASE_DIR__/backup/backup.mp4",
+
+  "twitch_url": "rtmp://live.twitch.tv/app/CHANGE_ME_STREAM_KEY",
+
+  "_comment_output": "The controller determines the backup video's resolution/fps/channels itself via ffprobe of the live stream on every broadcast start -- no need to set them here. These two fields only affect the QUALITY of the one-time backup transcode (when it doesn't match live): the video/audio bitrate of the resulting backup.prepared.mp4.",
+  "output_video_bitrate_kbps": 6000,
+  "output_audio_bitrate_kbps": 160,
+
+  "disconnect_timeout_sec": 1800,
+
+  "log_file": "__BASE_DIR__/controller/controller.log"
+}
