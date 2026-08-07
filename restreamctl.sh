@@ -26,6 +26,43 @@ pid_alive() {
   [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null
 }
 
+# Ті самі мінімуми, що й у controller/settings_store.py (MIN_CONNECT_
+# TIMEOUT_MS/MIN_READ_TIMEOUT_MS) -- продубльовані тут константами
+# bash-скрипта, без спільного джерела правди між bash і Python.
+MIN_CONNECT_TIMEOUT_MS=2500
+MIN_READ_TIMEOUT_MS=300
+
+# readTimeout у mediamtx.yml = connect_timeout_ms + read_timeout_ms з
+# controller/config.json -- перераховується й підміняється в файлі
+# перед КОЖНИМ стартом MediaMTX (тут -- ручний шлях через
+# restreamctl.sh; шлях через дашборд робить те саме сам, у Python,
+# controller/mediamtx_control.py). КЛАМП, не відмова: значення могли
+# потрапити в config.json ручним редагуванням, минаючи валідацію
+# Settings-вкладки дашборда -- одна занижена цифра в конфізі не
+# повинна блокувати старт усього сервісу.
+sync_mediamtx_read_timeout() {
+  local connect_ms read_ms total_ms
+  connect_ms="$(cfg connect_timeout_ms)"
+  read_ms="$(cfg read_timeout_ms)"
+
+  if [ -z "${connect_ms}" ] || ! [ "${connect_ms}" -ge "${MIN_CONNECT_TIMEOUT_MS}" ] 2>/dev/null; then
+    if [ -n "${connect_ms}" ]; then
+      echo "[WARNING] connect_timeout_ms (${connect_ms}) is below the minimum (${MIN_CONNECT_TIMEOUT_MS}ms) -- using ${MIN_CONNECT_TIMEOUT_MS}ms"
+    fi
+    connect_ms="${MIN_CONNECT_TIMEOUT_MS}"
+  fi
+
+  if [ -z "${read_ms}" ] || ! [ "${read_ms}" -ge "${MIN_READ_TIMEOUT_MS}" ] 2>/dev/null; then
+    if [ -n "${read_ms}" ]; then
+      echo "[WARNING] read_timeout_ms (${read_ms}) is below the minimum (${MIN_READ_TIMEOUT_MS}ms) -- using ${MIN_READ_TIMEOUT_MS}ms"
+    fi
+    read_ms="${MIN_READ_TIMEOUT_MS}"
+  fi
+
+  total_ms=$((connect_ms + read_ms))
+  sed -i -E "s/^readTimeout:.*/readTimeout: ${total_ms}ms/" "${MEDIAMTX_YML}"
+}
+
 # --- check ---------------------------------------------------------------
 
 cmd_check() {
@@ -124,6 +161,7 @@ cmd_start() {
   if pid_alive "${MEDIAMTX_PID_FILE}"; then
     echo "MediaMTX is already running (pid=$(cat "${MEDIAMTX_PID_FILE}"))"
   else
+    sync_mediamtx_read_timeout
     echo "Starting MediaMTX..."
     nohup "${MEDIAMTX_BIN}" "${MEDIAMTX_YML}" > "${MEDIAMTX_LOG}" 2>&1 < /dev/null &
     echo $! > "${MEDIAMTX_PID_FILE}"
@@ -227,20 +265,36 @@ cmd_credentials() {
     return 1
   fi
 
-  local obs_pass webhook_token port
+  local obs_pass dashboard_token port public_host
   obs_pass="$(grep -A2 'user: obs' "${MEDIAMTX_YML}" | grep 'pass:' | awk '{print $2}')"
-  webhook_token="$(cfg obs_webhook_token)"
+  dashboard_token="$(cfg dashboard_token)"
   port="$(cfg listen_port)"
+  public_host="$(cfg public_host)"
+  [ -z "${public_host}" ] && public_host="YOUR_VPS_IP"
+
+  local bold cyan reset
+  bold="\033[1m"
+  cyan="\033[36m"
+  reset="\033[0m"
 
   echo "== Connection details =="
   echo
-  echo "OBS -> Settings -> Stream -> Service: \"Custom...\":"
-  echo "  Server:      rtmp://YOUR_VPS_IP:1935/live"
-  echo "  Stream Key:  main?user=obs&pass=${obs_pass}"
+  echo "Dashboard -- OBS -> Docks -> Custom Browser Docks (or just open it"
+  echo "in any browser -- keep the URL private):"
+  echo -e "  ${bold}${cyan}http://${public_host}:${port}/dashboard?token=${dashboard_token}${reset}"
+  echo "  Settings tab: Twitch RTMP URL + Stream Key (Twitch Creator"
+  echo "  Dashboard -> Settings -> Stream -> Primary Stream Key)."
   echo
-  echo "OBS -> Tools -> Scripts -> obs-plugin/obs_graceful_stop.py:"
-  echo "  URL:   http://YOUR_VPS_IP:${port}/obs/graceful-stop"
-  echo "  Token: ${webhook_token}"
+  echo "OBS -> Settings -> Stream -> Service: \"Custom...\":"
+  echo -e "  Server:      ${bold}${cyan}rtmp://${public_host}:1935/live${reset}"
+  echo -e "  Stream Key:  ${bold}${cyan}main?user=obs&pass=${obs_pass}${reset}"
+  echo
+  echo "OBS -> add a Browser Source pointing at:"
+  echo -e "  ${bold}${cyan}http://${public_host}:${port}/obs-source?token=${dashboard_token}${reset}"
+  echo "Required for correctly detecting Start/Stop Streaming clicks. Set"
+  echo "Page permission to \"Full access to OBS\" (recommended) so it can"
+  echo "also stop the stream right away if something goes wrong at the"
+  echo "start of the broadcast."
 }
 
 # --- entrypoint ------------------------------------------------------------

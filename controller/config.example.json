@@ -4,7 +4,10 @@
   "listen_host": "0.0.0.0",
   "listen_port": 8790,
 
-  "obs_webhook_token": "__OBS_WEBHOOK_TOKEN__",
+  "_comment_public_host": "The public IP/hostname of this server -- used to build the OBS Server URL and the dashboard/obs-source links (restreamctl.sh credentials, install.sh's own printed instructions). install.sh asks for this on every run, since it's not a secret and might change.",
+  "public_host": "__PUBLIC_HOST__",
+
+  "dashboard_token": "__DASHBOARD_TOKEN__",
 
   "mediamtx_rtmp_host": "127.0.0.1",
   "mediamtx_rtmp_port": 1935,
@@ -20,7 +23,11 @@
   "output_video_bitrate_kbps": 6000,
   "output_audio_bitrate_kbps": 160,
 
-  "disconnect_timeout_sec": 1800,
+  "offline_timeout_sec": 1800,
+
+  "_comment_timeouts": "Two-phase silent-drop detection (CLAUDE.md, v12/v14). connect_timeout_ms: how long to wait for OBS's first frame after it connects (MediaMTX's own readTimeout, minimum 2500 -- real OBS needs several seconds for encoder warm-up + first keyframe, longer than a synthetic test source). read_timeout_ms: once data is flowing, how fast to react to a stalled network without dropping the OBS connection (minimum 300). mediamtx.yml's readTimeout is recalculated as their sum on every MediaMTX start -- don't edit it there directly.",
+  "connect_timeout_ms": 5000,
+  "read_timeout_ms": 500,
 
   "log_file": "__BASE_DIR__/controller/controller.log"
 }

@@ -10,6 +10,8 @@ timestamp + 8-бітний TimestampExtended, StreamID=0) + payload +
 самé декодування контейнера.
 """
 
+import os
+import select
 import struct
 
 FLV_HEADER = b"FLV\x01\x05\x00\x00\x00\x09" + struct.pack(">I", 0)
@@ -31,6 +33,31 @@ def read_exact(stream, n: int) -> bytes | None:
             return None
         buf += chunk
     return buf
+
+
+def _has_buffered_data(stream) -> bool:
+    """
+    True, якщо в `BufferedReader` уже є небуферизовано ще не віддані
+    байти -- перевіряється БЕЗ звернення до сирого fd. `stream.peek()`
+    сам по собі для цього не годиться: коли буфер порожній, він падає
+    назад на БЛОКУЮЧЕ читання сирого потоку, щоб було що повернути --
+    і саме тому зводить нанівець будь-який тайм-аут навколо нього
+    (перевірено: `select()`-з-тайм-аутом ніколи не спрацьовував,
+    `peek()` просто чекав на дані замість select-а). Тому тут сирий fd
+    тимчасово переводиться в неблокуючий режим лише на час самого
+    `peek()`-виклику й одразу повертається назад.
+    """
+    fd = stream.fileno()
+    was_blocking = os.get_blocking(fd)
+    if was_blocking:
+        os.set_blocking(fd, False)
+    try:
+        return bool(stream.peek(1))
+    except BlockingIOError:
+        return False
+    finally:
+        if was_blocking:
+            os.set_blocking(fd, True)
 
 
 def is_video_keyframe(payload: bytes) -> bool:
@@ -69,7 +96,15 @@ def write_flv_tag(stream, tag_type: int, timestamp: int, payload: bytes) -> None
     stream.write(struct.pack(">I", _TAG_HEADER_SIZE + len(payload)))
 
 
-def read_flv_tags(stream, source: str, on_tag) -> None:
+def read_flv_tags(
+    stream,
+    source: str,
+    on_tag,
+    *,
+    read_timeout_sec: float | None = None,
+    on_stall=None,
+    on_resume=None,
+) -> None:
     """
     Читає FLV-теги зі stream, поки не EOF, і викликає
     on_tag(source, tag_type, timestamp, payload) для кожного
@@ -79,6 +114,14 @@ def read_flv_tags(stream, source: str, on_tag) -> None:
     завершується/падає, ОС закриває його кінець pipe на запис, і
     read() тут одразу повертає b'' — жодного зовнішнього
     stop-сигналу не треба.
+
+    `read_timeout_sec` (лише для `relay` -- "Read timeout" з дашборда):
+    якщо задано, з ДРУГОГО тегу й далі очікування наступного тегу
+    обмежене цим часом -- порожнє очікування викликає `on_stall()`
+    (раз, поки пауза триває), відновлення даних -- `on_resume()`.
+    Перший тег після старту -- завжди БЕЗ таймауту (у цій фазі діє
+    лише зовнішній Connect timeout MediaMTX, очікування першого кадру
+    легітимно може бути довшим за `read_timeout_sec`).
     """
     header = read_exact(stream, len(FLV_HEADER) - 4)
     if header is None or header[:3] != b"FLV":
@@ -86,7 +129,29 @@ def read_flv_tags(stream, source: str, on_tag) -> None:
     if read_exact(stream, _PREV_TAG_SIZE_SIZE) is None:  # PreviousTagSize0
         return
 
+    first_tag = True
+    stalled = False
     while True:
+        if read_timeout_sec is not None and not first_tag:
+            # _has_buffered_data() -- перевірка ОБОВ'ЯЗКОВА перед
+            # select(): select дивиться на сирий fd, а BufferedReader
+            # міг уже вичитати з ядра більше байтів, ніж пішло в
+            # попередній read_exact(), і тримати лишок у власному
+            # буфері -- без цієї перевірки select міг би хибно сказати
+            # "даних нема", хоча читання й так одразу вдалось би.
+            if not _has_buffered_data(stream):
+                ready, _, _ = select.select([stream], [], [], read_timeout_sec)
+                if not ready:
+                    if not stalled:
+                        stalled = True
+                        if on_stall:
+                            on_stall()
+                    continue
+            if stalled:
+                stalled = False
+                if on_resume:
+                    on_resume()
+
         tag_header = read_exact(stream, _TAG_HEADER_SIZE)
         if tag_header is None:
             return
@@ -98,5 +163,6 @@ def read_flv_tags(stream, source: str, on_tag) -> None:
             return
         if read_exact(stream, _PREV_TAG_SIZE_SIZE) is None:
             return
+        first_tag = False
         if tag_type in (TAG_TYPE_AUDIO, TAG_TYPE_VIDEO, TAG_TYPE_SCRIPT):
             on_tag(source, tag_type, ts, payload)

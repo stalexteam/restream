@@ -1,0 +1,312 @@
+:root {
+  color-scheme: dark;
+  --bg: #14161a;
+  --panel: #1c1f25;
+  --border: #2b2f37;
+  --fg: #e6e8eb;
+  --muted: #8b909a;
+  --green: #3ecf6b;
+  --orange: #e0a227;
+  --red: #e0524a;
+  --gray: #5b616b;
+  --blue: #4a90e0;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --border: #dde1e6;
+    --fg: #1a1d21;
+    --muted: #666c76;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+}
+
+.tab-button {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.tab-button:hover {
+  color: var(--fg);
+}
+
+.tab-button.active {
+  color: #fff;
+  background: var(--blue);
+  border-color: var(--blue);
+}
+
+.tab-panel[hidden] {
+  display: none;
+}
+
+h2 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+
+.indicators {
+  display: flex;
+  gap: 6px;
+}
+
+.indicator {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  letter-spacing: 0.02em;
+  min-width: 46px;
+  text-align: center;
+}
+
+.ind-connecting { color: var(--muted); }
+.ind-live { color: var(--green); border-color: var(--green); }
+.ind-lost { color: var(--red); border-color: var(--red); }
+
+/* Solid fill (не як WS-індикатор з border-only) -- статус трансляції
+   найважливіший, має виділятись сильніше за решту. */
+#broadcast-indicator {
+  min-width: 70px;
+}
+
+.bstate-offline { background: var(--gray); border-color: var(--gray); color: #fff; }
+.bstate-live { background: var(--green); border-color: var(--green); color: #0c1f13; }
+.bstate-fallback { background: var(--orange); border-color: var(--orange); color: #1a1d21; }
+.bstate-halt { background: var(--red); border-color: var(--red); color: #fff; }
+
+#components {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 14px 16px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th, td {
+  text-align: left;
+  padding: 6px 8px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+}
+
+th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+tr:last-child td {
+  border-bottom: none;
+}
+
+.status-up { color: var(--green); }
+.status-down { color: var(--muted); }
+
+/* Немає /ws-з'єднання -- дані застарілі, форма нічого не збереже. */
+body.ws-disconnected #tab-status,
+body.ws-disconnected #tab-settings {
+  filter: blur(0.8px);
+  opacity: 0.6;
+  pointer-events: none;
+  transition: filter 0.2s, opacity 0.2s;
+}
+
+#settings-form {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.field label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 9px;
+}
+
+.field input:focus {
+  outline: 2px solid var(--blue);
+  outline-offset: -1px;
+}
+
+.masked-field {
+  display: flex;
+  gap: 6px;
+}
+
+.masked-field input {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, monospace;
+}
+
+.reveal-toggle {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 0 12px;
+  cursor: pointer;
+}
+
+.reveal-toggle:hover {
+  color: var(--fg);
+}
+
+.errors {
+  font-size: 12px;
+  color: var(--red);
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Специфічність класу перебиває UA-правило `[hidden]{display:none}` --
+   без цього `hidden=true` не ховає блок, доки він `display:flex`. */
+.errors:not([hidden]) {
+  display: flex;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.actions button {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.actions button:hover {
+  border-color: var(--muted);
+}
+
+.actions button.primary {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #fff;
+}
+
+.actions button.primary:hover {
+  opacity: 0.9;
+}
+
+#toast-container {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 8px 8px;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  width: 100%;
+  max-width: 420px;
+  box-sizing: border-box;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  opacity: 0.92;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  animation: toast-in 0.2s ease-out;
+}
+
+.toast:hover {
+  opacity: 1;
+}
+
+.toast-info { background: var(--blue); }
+.toast-warning { background: var(--orange); color: #1a1d21; }
+.toast-error { background: var(--red); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}

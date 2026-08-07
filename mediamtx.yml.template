@@ -11,18 +11,23 @@ logDestinations: [stdout]
 # dead and closing it (even if the TCP socket itself is still open --
 # a "silent" drop: the network is gone, but the connection hasn't
 # formally closed yet). This closing is exactly what triggers
-# runOnUnavailable below -> the backup video.
+# runOnUnavailable below -> the backup video, as a slow backstop.
 #
-# WARNING: this same timeout also applies to connection setup (RTMP
-# handshake + first frame from the encoder), not just to a steady
-# stream. Too low a value prevents connecting at all, not just "detects
-# a drop faster". Verified empirically on a clean localhost with zero
-# network delay: 1000ms and 1500ms consistently failed to connect at
-# all (0/5 successful attempts); 2000ms -- consistently 5/5, which is
-# the current value. On a real network (OBS -> VPS over the internet)
-# an even bigger margin is needed -- don't go below 2000ms without
-# re-testing on a real setup.
-readTimeout: 2000ms
+# This value is DERIVED, not something to hand-edit: it's
+# connect_timeout_ms + read_timeout_ms from controller/config.json,
+# recalculated and overwritten right before every MediaMTX start --
+# by restreamctl.sh (manual `start`/`restart`) or by the controller
+# itself (dashboard Settings -> Apply & Restart,
+# controller/mediamtx_control.py). Editing it here by hand has no
+# lasting effect; it'll be overwritten on the next start. Fast
+# detection of a stalled stream during an active broadcast is handled
+# separately, at the controller level (read_timeout_ms) -- this
+# combined value only needs to comfortably cover the RTMP handshake +
+# first-frame wait. A real OBS client needs noticeably more of this
+# than a synthetic test source (encoder warm-up + first keyframe can
+# take a couple of seconds on their own) -- see connect_timeout_ms's
+# own minimum in controller/settings_store.py.
+readTimeout: 5500ms
 
 # We don't need MediaMTX's control API -- the controller manages the
 # ffmpeg processes directly, so it's disabled to avoid an unnecessary
