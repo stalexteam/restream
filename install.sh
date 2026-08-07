@@ -96,17 +96,47 @@ with open(tmp, 'w') as f:
 os.replace(tmp, path)
 "
 
-# Значення для друку в кінці -- читаємо тепер, а не перегенеровуємо
-# жодних файлів (obs-dock.html/file://-міст видалено, панель
-# моніторингу й browser-source для ручного стопу віддаються прямо з
-# HTTP-сервера контролера, окремих локальних файлів більше не треба).
+# Read the values needed both for the local files generated below and
+# for the printed instructions at the end.
 read -r GEN_PUBLIC_HOST GEN_DASHBOARD_TOKEN GEN_PORT <<< "$(python3 -c "
 import json
 c = json.load(open('${BASE_DIR}/controller/config.json'))
 print(c.get('public_host', 'YOUR_VPS_IP'), c.get('dashboard_token', ''), c.get('listen_port', 8790))
 ")"
 DASHBOARD_URL="http://${GEN_PUBLIC_HOST}:${GEN_PORT}/dashboard?token=${GEN_DASHBOARD_TOKEN}"
-OBS_SOURCE_URL="http://${GEN_PUBLIC_HOST}:${GEN_PORT}/obs-source?token=${GEN_DASHBOARD_TOKEN}"
+OBS_WS_URL="ws://${GEN_PUBLIC_HOST}:${GEN_PORT}/ws?token=${GEN_DASHBOARD_TOKEN}"
+
+# Two local files the user copies to the OBS machine (both regenerated on
+# every run -- unlike config.json/mediamtx.yml they have no hand edits
+# worth preserving, and the embedded URL changes with public_host/token).
+# No `&` or `#` in these URLs (single hex-token query param), so a plain
+# sed substitution is safe.
+#   obs-dock.html   -- Custom Browser Dock: holds the dashboard in an
+#                      iframe with a "retrying…" screen while the server
+#                      is unreachable (instead of OBS's bare "Couldn't
+#                      load that page").
+#   obs-source.html -- Browser Source (in a scene): standalone tracker
+#                      that talks to /ws directly. Loading it as a local
+#                      file:// keeps window.obsstudio reliable and lets
+#                      the /ws URL be baked in (location.host is empty in
+#                      file://).
+sed \
+  -e "s#__DASHBOARD_URL__#${DASHBOARD_URL}#g" \
+  "${BASE_DIR}/controller/obs-dock.html.template" > "${BASE_DIR}/obs-dock.html"
+sed \
+  -e "s#__WS_URL__#${OBS_WS_URL}#g" \
+  "${BASE_DIR}/controller/obs-source.html.template" > "${BASE_DIR}/obs-source.html"
+
+# Restrict the secret-bearing files to the owner: mediamtx.yml (RTMP
+# passwords), config.json (dashboard token + internal password), and the
+# two generated OBS files (dashboard URL/WS URL with the token). Harmless
+# on a single-user VPS, important on a shared one. `|| true` -- never let
+# a chmod failure abort the install.
+chmod 600 \
+  "${BASE_DIR}/mediamtx.yml" \
+  "${BASE_DIR}/controller/config.json" \
+  "${BASE_DIR}/obs-dock.html" \
+  "${BASE_DIR}/obs-source.html" 2>/dev/null || true
 
 if [ ! -f "${BASE_DIR}/backup/backup.mp4" ]; then
   echo "==> WARNING: ${BASE_DIR}/backup/backup.mp4 not found"
@@ -122,6 +152,7 @@ FINAL_OBS_PASS="$(grep -A2 'user: obs' "${BASE_DIR}/mediamtx.yml" | grep 'pass:'
 
 BOLD="\033[1m"
 CYAN="\033[36m"
+RED="\033[31m"
 RESET="\033[0m"
 
 echo
@@ -134,9 +165,10 @@ echo "     settings as your stream -- see README step 3) as:"
 echo -e "       ${BOLD}${CYAN}${BASE_DIR}/backup/backup.mp4${RESET}"
 echo "  2. Start the server:"
 echo -e "       ${BOLD}${CYAN}./restreamctl.sh start${RESET}"
-echo "  3. Add the dashboard as an OBS -> Docks -> Custom Browser Dock"
-echo "     (or just open it in any browser -- keep the URL private):"
-echo -e "       ${BOLD}${CYAN}${DASHBOARD_URL}${RESET}"
+echo "  3. Add the dashboard as an OBS -> Docks -> Custom Browser Dock."
+echo "     Copy this generated file to the OBS machine and point the dock"
+echo "     at it via a local file path (see README step 7 for details):"
+echo -e "       ${BOLD}${CYAN}${BASE_DIR}/obs-dock.html${RESET}"
 echo "     On its Settings tab, set the Twitch RTMP URL + your Stream Key"
 echo "     (Twitch Creator Dashboard -> Settings -> Stream -> Primary Stream"
 echo "     Key) and hit Apply & Restart (nothing is streaming yet, so a"
@@ -145,12 +177,24 @@ echo "     the next restart)."
 echo "  4. Configure OBS -> Settings -> Stream -> Service: \"Custom...\":"
 echo -e "       Server:      ${BOLD}${CYAN}rtmp://${GEN_PUBLIC_HOST}:1935/live${RESET}"
 echo -e "       Stream Key:  ${BOLD}${CYAN}main?user=obs&pass=${FINAL_OBS_PASS}${RESET}"
-echo "  5. Configure OBS -> add a Browser Source pointing at:"
-echo -e "       ${BOLD}${CYAN}${OBS_SOURCE_URL}${RESET}"
+echo "  5. Add a Browser Source (in a scene, size 32x32). Copy this"
+echo "     generated file to the OBS machine and point the source at it"
+echo "     via a local file path (see README step 7 for details):"
+echo -e "       ${BOLD}${CYAN}${BASE_DIR}/obs-source.html${RESET}"
 echo "     Required for correctly detecting Start/Stop Streaming clicks."
 echo "     Set Page permission to \"Full access to OBS\" (recommended) so"
 echo "     it can also stop the stream right away if something goes wrong"
 echo "     at the start of the broadcast."
+echo
+echo -e "${BOLD}${RED}FIREWALL:${RESET}"
+echo -e "${RED}  Ports you need to OPEN (ideally only to your own IP(s) -- the${RESET}"
+echo -e "${RED}  token/RTMP password travel unencrypted over plain HTTP/RTMP):${RESET}"
+echo -e "${RED}    ${BOLD}1935/tcp${RESET}${RED}  RTMP ingest from OBS${RESET}"
+echo -e "${RED}    ${BOLD}8790/tcp${RESET}${RED}  dashboard + WebSocket (OBS dock/source, browser)${RESET}"
+echo -e "${RED}  Ports you need to confirm are CLOSED to the outside -- we disable${RESET}"
+echo -e "${RED}  these MediaMTX features, so nothing should be listening on them:${RESET}"
+echo -e "${RED}    ${BOLD}8554${RESET}${RED} RTSP   ${BOLD}8888${RESET}${RED} HLS   ${BOLD}8889${RESET}${RED} WebRTC   ${BOLD}8890${RESET}${RED} SRT   ${BOLD}9997${RESET}${RED} control API${RESET}"
+echo -e "${RED}  ufw: ${BOLD}ufw allow from <your-ip> to any port 1935,8790 proto tcp${RESET}"
 echo
 echo "(./restreamctl.sh check/status/logs are there if you need them later.)"
 echo "======================================================================"

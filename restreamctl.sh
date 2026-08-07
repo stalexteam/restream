@@ -285,12 +285,19 @@ cmd_credentials() {
   echo "  Settings tab: Twitch RTMP URL + Stream Key (Twitch Creator"
   echo "  Dashboard -> Settings -> Stream -> Primary Stream Key)."
   echo
+  echo "  Tip: for a dock that survives the server being down (retries"
+  echo "  instead of a bare error page), copy this generated wrapper to"
+  echo "  the OBS machine and point the dock at it via a local file path:"
+  echo -e "  ${bold}${cyan}${BASE_DIR}/obs-dock.html${reset}"
+  echo
   echo "OBS -> Settings -> Stream -> Service: \"Custom...\":"
   echo -e "  Server:      ${bold}${cyan}rtmp://${public_host}:1935/live${reset}"
   echo -e "  Stream Key:  ${bold}${cyan}main?user=obs&pass=${obs_pass}${reset}"
   echo
-  echo "OBS -> add a Browser Source pointing at:"
-  echo -e "  ${bold}${cyan}http://${public_host}:${port}/obs-source?token=${dashboard_token}${reset}"
+  echo "OBS -> add a Browser Source (in a scene, size 32x32). Copy this"
+  echo "generated file to the OBS machine and point the source at it via a"
+  echo "local file path:"
+  echo -e "  ${bold}${cyan}${BASE_DIR}/obs-source.html${reset}"
   echo "Required for correctly detecting Start/Stop Streaming clicks. Set"
   echo "Page permission to \"Full access to OBS\" (recommended) so it can"
   echo "also stop the stream right away if something goes wrong at the"

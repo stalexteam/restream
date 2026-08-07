@@ -67,19 +67,19 @@ bash install.sh
 
 This installs `ffmpeg`, `python3`, and the MediaMTX binary, and
 generates two config files with random passwords: `mediamtx.yml` and
-`controller/config.json`. It asks for this server's public
-IP/hostname (used to build the OBS Server URL and dashboard/obs-source
+`controller/config.json`. It **asks for this server's public
+IP/hostname** (used to build the OBS Server URL and dashboard/obs-source
 links) -- this part re-runs every time you run `install.sh` again,
 since it's not a secret and might change (e.g. moving to a different
 VPS); leave it empty to fill in later, either by re-running
 `install.sh` or editing `public_host` in `controller/config.json`
-directly. At the end it prints, highlighted:
+directly. **At the end it prints, highlighted:**
 
 - the RTMP login/password for OBS,
 - the URL (with an access token baked in) for the status dashboard,
 - the URL (same token) for the OBS browser-source stop control.
 
-You'll need these in steps 6 and 7. If you forget them, you can look
+**You'll need these in steps 6 and 7.** If you forget them, you can look
 them up again any time:
 
 ```bash
@@ -88,7 +88,7 @@ them up again any time:
 
 ### 3. Add a backup video
 
-Copy your file to `backup/backup.mp4`.
+**Copy your file to `backup/backup.mp4`.**
 
 Any format `ffmpeg` understands works (mp4, mkv, mov, avi...) — you
 don't need to manually match codec, resolution, fps, or audio channel
@@ -100,8 +100,8 @@ few seconds to a couple of minutes after OBS first connects — well
 before the backup would actually be needed on a disconnect.
 
 **For best results**, use a file encoded with the same settings as
-your stream. The easiest way to get one: in OBS, click "Start
-Recording" (with the same Settings -> Output you use for streaming)
+your stream. **The easiest way to get one: in OBS, click "Start
+Recording"** (with the same Settings -> Output you use for streaming)
 and record a few minutes — a recording like that matches the live
 stream exactly, so no automatic transcoding is needed and the backup
 is ready to use immediately.
@@ -116,8 +116,8 @@ Prints `[OK]`/`[WARNING]`/`[ERROR]` for each item (config files, the
 backup video and its codecs). `twitch_url` still being the
 placeholder value only prints a `[WARNING]` at this point -- it does
 not block starting the service, because it's set from the dashboard in
-step 6, after the service is already running. Fix anything marked
-`[ERROR]` before continuing.
+step 6, after the service is already running. **Fix anything marked
+`[ERROR]` before continuing.**
 
 ### 5. Start
 
@@ -130,7 +130,7 @@ the current state.
 
 ### 6. Set your Twitch key and other settings
 
-Open the dashboard URL from `install.sh`'s output (or
+**Open the dashboard URL** from `install.sh`'s output (or
 `./restreamctl.sh credentials`) in any browser:
 
 ```
@@ -139,7 +139,7 @@ http://YOUR_VPS_IP:8790/dashboard?token=YOUR_TOKEN
 
 Switch to the **Settings** tab and fill in:
 
-- `twitch_url` — your RTMP URL with your real Twitch stream key,
+- `twitch_url` — **your RTMP URL with your real Twitch stream key**,
   format: `rtmp://live.twitch.tv/app/YOUR_STREAM_KEY`. The field is
   masked by default (it's a secret) -- click "Show" to check it before
   saving.
@@ -191,26 +191,63 @@ directly if you ever need them.
    `install.sh`'s output; this exact format — `user=...&pass=...`
    inside the stream key — is required, not `rtmp://user:pass@host`,
    because that's how MediaMTX expects RTMP auth).
-4. Docks -> Custom Browser Docks -> add a dock pointing at the
-   dashboard URL (`install.sh`'s output, or `./restreamctl.sh
-   credentials`). Shows live status (broadcast state, components,
-   CPU/mem) right inside OBS, and has a Settings tab for
-   `twitch_url`/timeouts/backup path -- this is monitoring/config
-   only, it doesn't need or use anything from OBS itself.
-5. Add a **Browser Source** (not a dock) to any scene, pointing at the
-   obs-source URL (`install.sh`'s output, or `./restreamctl.sh
-   credentials`). Required for correctly detecting Start/Stop
-   Streaming clicks (see "Everyday scenarios" below) -- it has to be a
-   Browser Source specifically, not a dock: OBS's `window.obsstudio`
-   API has long-standing bugs in Custom Browser Docks (reported since
-   2021), but works reliably in a Browser Source. It renders nothing
-   and doesn't need to be visible -- add it to any scene, hidden or
-   not. Set its **Page permission** to **"Full access to OBS"**
-   (recommended) so it can also stop the stream in OBS right away if
-   Twitch turns out to be unreachable at the start of the broadcast
-   (e.g. a wrong stream key) -- without that permission level, the
-   service still stops on its own end, but OBS keeps publishing into
-   the void until you stop it yourself.
+4. Docks -> Custom Browser Docks -> add a dock for the dashboard. Shows
+   live status (broadcast state, components, CPU/mem) right inside OBS,
+   and has a Settings tab for `twitch_url`/timeouts/backup path -- this
+   is monitoring/config only, it doesn't need or use anything from OBS
+   itself. Two ways to point the dock at it:
+   - **Recommended:** `install.sh` generates `obs-dock.html` in the
+     project root. Copy it to the OBS machine and set the dock URL to
+     that local file -- OBS takes a plain Windows path (`C:\obs-dock.html`).
+     It holds the dashboard in an iframe and, when the server is down
+     (VPS rebooting, controller restarting), shows a "retrying…" screen
+     and reconnects on its own -- instead of OBS's bare "Couldn't load
+     that page". It picks the dashboard back up automatically once the
+     server returns, including after you refresh the page inside the
+     dock. (The dashboard URL with your token is embedded in the file;
+     it's hidden behind a "Show dashboard address" button on the retry
+     screen.)
+   - Or point the dock straight at the dashboard URL (`install.sh`'s
+     output, or `./restreamctl.sh credentials`). Simpler, but no retry
+     screen -- if the server is down when OBS loads the dock, you get
+     the bare browser error and have to click retry yourself.
+5. Add a **Browser Source** (not a dock) to any scene. `install.sh`
+   generates `obs-source.html` in the project root -- copy it to the
+   OBS machine and point the Browser Source at that local file -- OBS
+   takes a plain Windows path (`C:\obs-source.html`). Set its **Width
+   and Height to 32 x 32**. Required for correctly detecting Start/Stop
+   Streaming
+   clicks (see "Everyday scenarios" below).
+
+   Why a local file and a Browser Source, specifically:
+   - It has to be a **Browser Source**, not a dock: OBS's
+     `window.obsstudio` API has long-standing bugs in Custom Browser
+     Docks (reported since 2021), but works reliably in a Browser
+     Source.
+   - A **local file** (rather than the server URL) keeps the page
+     self-contained: it connects to the controller's WebSocket directly
+     (the address is baked into the file by `install.sh`), so it doesn't
+     depend on being served over HTTP.
+
+   It's almost entirely invisible: while connected to the server it
+   renders nothing (fully transparent in OBS). If it's connecting it
+   shows a small yellow spinner in the top-left 32x32; if it can't reach
+   the server, a red error dot -- so you can see at a glance whether it's
+   working. Add it to any **one** scene, hidden or not -- there's no
+   "global scene" in OBS and you don't need one: a Browser Source keeps
+   running (and stays connected) even while its scene isn't the active
+   one. Just make sure its **"Shutdown source when not visible"** option
+   stays **unchecked** (the default) -- enabling it would disconnect the
+   tracker every time you switch away from that scene. If you'd rather
+   keep it out of the way, put it in a throwaway "utility" scene you
+   never cut to.
+
+   Set its **Page permission** to **"Full access to OBS"** (recommended)
+   so it can also stop the stream in OBS right away if Twitch turns out
+   to be unreachable at the start of the broadcast (e.g. a wrong stream
+   key) -- without that permission level, the service still stops on its
+   own end, but OBS keeps publishing into the void until you stop it
+   yourself.
 6. Settings -> Output (Advanced mode) -> Streaming -> **Keyframe
    Interval: 2** (instead of "Auto"). This affects how long it takes
    for live video to appear after a start/recovery: the service waits

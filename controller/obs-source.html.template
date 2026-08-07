@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<!--
+  Локальний файл для OBS Browser Source (додається в сцену, НЕ dock).
+  Користувач копіює згенерований obs-source.html на машину з OBS і додає
+  Browser Source за ЛОКАЛЬНИМ шляхом (OBS розуміє звичайний Windows-шлях,
+  напр. C:\restream\obs-source.html -- без file:/// і без прямих слешів),
+  розмір джерела 32x32. __WS_URL__ (ws://host:port/ws?token=...) підставляє
+  install.sh при генерації -- тому файл автономний, не залежить від того,
+  за яким URL він відкритий (location.host у file:// порожній).
+
+  Навіщо саме Browser Source, а не dock, і навіщо window.obsstudio:
+  стежить за статусом трансляції в OBS (події obsStreamingStopping/
+  obsStreamingStarted + getStatus()-поллінг як резерв) і повідомляє
+  сервер у мить кліку "Stop Streaming", щоб трансляція завершувалась
+  одразу, без заглушки. Також слухає команду сервера stop_streaming
+  (window.obsstudio.stopStreaming()) -- коли Twitch недосяжний за цю
+  трансляцію (напр. невірний stream key). Для stopStreaming() потрібен
+  Page permission "Full access to OBS". Дивись README, крок 7.
+
+  Візуально: у нормі (WS підключений) сторінка порожня -> у OBS джерело
+  прозоре. Поки WS підключається -- жовтий індикатор; коли з'єднання
+  немає -- червоний. Індикатор -- рівно 32x32, у лівому верхньому куті.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>restream-controller -- OBS tracker</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+  }
+
+  /* Рівно 32x32 у куті -- користувач виставляє такий самий розмір
+     Browser Source у OBS. Схований, поки WS підключений (прозоро). */
+  #ind {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 32px;
+    height: 32px;
+  }
+  #ind.state-connected {
+    display: none;
+  }
+
+  .ic {
+    position: absolute;
+    top: 0;
+    left: 0;
+    display: none;
+  }
+  #ind.state-connecting .ic-connecting {
+    display: block;
+    transform-origin: 16px 16px;
+    animation: spin 0.9s linear infinite;
+  }
+  #ind.state-error .ic-error {
+    display: block;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+</style>
+</head>
+<body>
+  <div id="ind" class="state-connecting" aria-hidden="true">
+    <!-- Connecting / reconnecting: yellow spinner. -->
+    <svg class="ic ic-connecting" width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="16" cy="16" r="12" fill="none" stroke="#e0a227" stroke-width="4"
+              stroke-linecap="round" stroke-dasharray="20 55" opacity="0.95"/>
+    </svg>
+    <!-- Disconnected: red circle with white "!". -->
+    <svg class="ic ic-error" width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="16" cy="16" r="14" fill="#e0524a"/>
+      <rect x="14.4" y="7" width="3.2" height="11" rx="1.6" fill="#fff"/>
+      <circle cx="16" cy="23.5" r="2" fill="#fff"/>
+    </svg>
+  </div>
+
+<script>
+  // ws://host:port/ws?token=... -- підставлено install.sh (файл автономний).
+  const WS_URL = "__WS_URL__";
+
+  const POLL_INTERVAL_MS = 1000;
+  const RECONNECT_MIN_DELAY_MS = 1000;
+  const RECONNECT_MAX_DELAY_MS = 3000;
+
+  const ind = document.getElementById("ind");
+
+  let socket = null;
+  let reconnectDelay = RECONNECT_MIN_DELAY_MS;
+  let lastKnownStreaming = null;
+
+  function setState(state) {
+    // state: "connecting" | "connected" | "error"
+    ind.className = "state-" + state;
+  }
+
+  function connect() {
+    setState("connecting");
+    socket = new WebSocket(WS_URL);
+    socket.onopen = () => {
+      reconnectDelay = RECONNECT_MIN_DELAY_MS;
+      setState("connected");
+    };
+    socket.onmessage = (event) => {
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch (error) {
+        return;
+      }
+      // Сервер сам зупиняє OBS, якщо Twitch жодного разу не був
+      // досяжний за цю трансляцію (невірний stream key) -- без цього
+      // OBS далі публікував би в порожнечу, поки користувач сам не
+      // натисне Stop. Потребує Page permission: Full access to OBS.
+      if (message.type === "control" && message.action === "stop_streaming") {
+        if (window.obsstudio && window.obsstudio.stopStreaming) {
+          window.obsstudio.stopStreaming();
+        }
+      }
+    };
+    socket.onclose = () => {
+      setState("error");
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_DELAY_MS);
+    };
+    socket.onerror = () => socket && socket.close();
+  }
+
+  function send(command) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ command }));
+    }
+  }
+
+  function handleStreamingStatus(streaming) {
+    if (lastKnownStreaming === null) {
+      // Перший тік -- невідомо, яким був стан ДО цього (джерело могло
+      // бути додане/перезавантажене посеред уже активного ефіру),
+      // тож лише фіксуємо базову лінію, нічого не шлемо.
+      lastKnownStreaming = streaming;
+      return;
+    }
+    if (lastKnownStreaming && !streaming) {
+      send("stop_broadcast");
+    } else if (!lastKnownStreaming && streaming) {
+      send("obs_streaming_started");
+    }
+    lastKnownStreaming = streaming;
+  }
+
+  function poll() {
+    if (window.obsstudio && window.obsstudio.getStatus) {
+      window.obsstudio.getStatus((status) => handleStreamingStatus(status.streaming));
+    }
+  }
+
+  // obsStreamingStopping/-Started -- швидший шлях за getStatus()
+  // polling (до 1с затримки): fires одразу на клік Stop/Start, до
+  // того як OBS реально розірве RTMP до MediaMTX. obs-browser
+  // диспатчить ці події на window, не на document. getStatus()
+  // лишається як бекап-шлях на випадок, якщо подія раптом не прийде
+  // (обидва йдуть через ту саму handleStreamingStatus() з
+  // дедуплікацією по lastKnownStreaming -- подвійний сигнал для
+  // одного переходу нешкідливий).
+  window.addEventListener("obsStreamingStopping", () => handleStreamingStatus(false));
+  window.addEventListener("obsStreamingStarted", () => handleStreamingStatus(true));
+
+  connect();
+  setInterval(poll, POLL_INTERVAL_MS);
+</script>
+</body>
+</html>

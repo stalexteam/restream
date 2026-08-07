@@ -23,6 +23,12 @@ OPCODE_CLOSE = 0x8
 OPCODE_PING = 0x9
 OPCODE_PONG = 0xA
 
+# Стеля розміру вхідного фрейму. Наші клієнти шлють лише крихітний JSON
+# (команди дашборда); фрейм більший за це -- зловживання (клієнт оголошує
+# довжину до 2^64 і змушує сервер прочитати її в пам'ять + XOR-розмаскувати).
+# Понад ліміт -- розриваємо з'єднання, а не виділяємо пам'ять.
+_MAX_FRAME_PAYLOAD = 1 << 20  # 1 MiB
+
 
 def handshake(handler) -> bool:
     """
@@ -104,6 +110,11 @@ def recv_frame(handler) -> tuple[int, bytes] | None:
         length = struct.unpack("!H", handler.rfile.read(2))[0]
     elif length == 127:
         length = struct.unpack("!Q", handler.rfile.read(8))[0]
+
+    # Завеликий фрейм -- не читаємо payload у пам'ять, сигналимо закриття
+    # (викликач трактує None як закрите з'єднання й розриває клієнта).
+    if length > _MAX_FRAME_PAYLOAD:
+        return None
 
     mask_key = handler.rfile.read(4) if masked else b""
 

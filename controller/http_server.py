@@ -1,7 +1,9 @@
 """
 HTTP-шар контролера: хуки MediaMTX (`/hooks/*`), локальний `/status`
-для `restreamctl.sh`, і дашборд (`/dashboard`, `/obs-source`, статичні
-асети, `/ws` — push-канал стану й канал команд).
+для `restreamctl.sh`, і дашборд (`/dashboard`, статичні асети,
+`/ws` — push-канал стану й канал команд). OBS-трекер (obs-source.html)
+більше не віддається сервером -- це автономний локальний файл, що
+підключається напряму до `/ws` (див. controller/obs-source.html.template).
 """
 
 import hmac
@@ -22,11 +24,24 @@ _STATIC_CONTENT_TYPES = {
     "dashboard.js": "application/javascript; charset=utf-8",
 }
 
+# Ліміт тіла POST-запиту. Хуки MediaMTX шлють крихітні form-дані; усе
+# більше -- зловживання. Без цього ліміту зовнішній клієнт міг би
+# оголосити величезний Content-Length і змусити сервер читати його в
+# пам'ять ЩЕ ДО перевірки маршруту/localhost (memory-DoS).
+_MAX_REQUEST_BODY = 65536
+
 
 def make_handler(controller, config: dict, hub, config_path: Path):
     dashboard_dir = controller.base_dir / "controller" / "dashboard"
 
     class Handler(BaseHTTPRequestHandler):
+        # Обмежує читання самого запиту (рядок запиту + заголовки, і наше
+        # читання тіла нижче). Без нього з'єднання, яке відкрилось і нічого
+        # (або дуже повільно) не шле, тримало б потік ThreadingHTTPServer
+        # вічно -- дешевий неавтентифікований slowloris-DoS. Для /ws після
+        # хендшейку керування таймінгом бере на себе _serve_ws (select).
+        timeout = 15
+
         def log_message(self, fmt, *args):
             logging.debug("http: " + fmt, *args)
 
@@ -62,7 +77,16 @@ def make_handler(controller, config: dict, hub, config_path: Path):
         def do_POST(self):
             # Зчитуємо і відкидаємо тіло запиту (хуки MediaMTX шлють form-дані,
             # нам вони не потрібні — весь контекст ми й так знаємо з конфігу).
-            length = int(self.headers.get("Content-Length", 0))
+            # Спершу перевіряємо/обмежуємо розмір, і лише потім читаємо в
+            # пам'ять -- захист від memory-DoS оголошеним велетенським тілом.
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except ValueError:
+                self._send(400, {"error": "bad Content-Length"})
+                return
+            if length < 0 or length > _MAX_REQUEST_BODY:
+                self._send(413, {"error": "request body too large"})
+                return
             if length:
                 self.rfile.read(length)
 
@@ -108,21 +132,6 @@ def make_handler(controller, config: dict, hub, config_path: Path):
                     # Токен їде в query-рядку самого URL цієї сторінки --
                     # не даємо йому піти назовні через Referer, якщо
                     # колись з'явиться будь-яке зовнішнє посилання.
-                    {"Referrer-Policy": "no-referrer"},
-                )
-                return
-
-            if path == "/obs-source":
-                # Компактна сторінка для OBS Browser Source в сцені --
-                # лише статус-пігулка й кнопка ручного стопу, без вкладки
-                # Settings. Той самий токен, що й /dashboard/-ws (одна
-                # спільна межа авторизації для всього дашборд-шару).
-                if not self._check_dashboard_token(query):
-                    self._send(401, {"error": "invalid token"})
-                    return
-                self._send_file(
-                    dashboard_dir / "obs-source.html",
-                    "text/html; charset=utf-8",
                     {"Referrer-Policy": "no-referrer"},
                 )
                 return

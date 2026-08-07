@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<!--
+  Локальний файл-обгортка для OBS Custom Browser Dock. Користувач копіює
+  згенерований obs-dock.html на машину з OBS і додає док за ЛОКАЛЬНИМ
+  шляхом (OBS розуміє звичайний Windows-шлях, напр. C:\restream\obs-dock.html
+  -- без file:/// і без прямих слешів), а не напряму на http-URL
+  дашборда. Причина: коли сам сервер (VPS/контролер) недоступний, прямий
+  http-док показує стандартну помилку браузера ("Couldn't load that
+  page"), без жодних повторних спроб. Ця обгортка тримає дашборд в
+  <iframe>, а поки сервер недоступний -- показує власну заставку з
+  автоматичними повторними спробами й підхоплює дашборд, щойно він
+  піднявся. __DASHBOARD_URL__ підставляє install.sh при генерації.
+
+  Це ЛИШЕ моніторинг/налаштування (той самий /dashboard). Детекція кліку
+  "Stop Streaming" у OBS -- окремий obs-source.html як Browser Source,
+  ця обгортка до неї відношення не має.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>restream dashboard</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #14161a;
+    color: #e6e8eb;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+    overflow: hidden;
+  }
+
+  #frame {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    display: none;
+  }
+  #frame.visible {
+    display: block;
+  }
+
+  #overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 24px;
+    text-align: center;
+    background: #14161a;
+  }
+  #overlay.hidden {
+    display: none;
+  }
+
+  .spinner {
+    width: 34px;
+    height: 34px;
+    border: 3px solid #2b2f37;
+    border-top-color: #4a90e0;
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .title {
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .subtitle,
+  #retry-note {
+    font-size: 13px;
+    color: #8b909a;
+    line-height: 1.5;
+    max-width: 360px;
+  }
+  #retry-note {
+    min-height: 18px;
+  }
+
+  button {
+    background: #1c1f25;
+    border: 1px solid #2b2f37;
+    color: #8b909a;
+    font: inherit;
+    font-size: 13px;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  button:hover {
+    color: #e6e8eb;
+    border-color: #4a90e0;
+  }
+
+  .actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+  }
+
+  #url-box {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    max-width: 92%;
+    margin-top: 4px;
+    padding: 8px 10px;
+    background: #1c1f25;
+    border: 1px solid #2b2f37;
+    border-radius: 6px;
+  }
+  #url-box[hidden] {
+    display: none;
+  }
+  #url-text {
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+    color: #e6e8eb;
+    word-break: break-all;
+    user-select: all;
+  }
+  #url-box button {
+    flex: none;
+    padding: 4px 10px;
+  }
+</style>
+</head>
+<body>
+  <iframe id="frame" title="restream dashboard"></iframe>
+
+  <div id="overlay">
+    <div class="spinner"></div>
+    <div class="title">Can't reach the restream dashboard</div>
+    <div class="subtitle">
+      The server may be starting up or temporarily unavailable.
+    </div>
+    <div id="retry-note">Checking…</div>
+    <div class="actions">
+      <button id="retry-now" type="button">Retry now</button>
+      <button id="toggle-url" type="button">Show dashboard address</button>
+    </div>
+    <div id="url-box" hidden>
+      <span id="url-text"></span>
+      <button id="hide-url" type="button">Hide</button>
+    </div>
+  </div>
+
+<script>
+  const DASHBOARD_URL = "__DASHBOARD_URL__";
+
+  const HEALTHY_INTERVAL_MS = 4000;   // recheck cadence once things are fine
+  const MIN_RETRY_MS = 1000;          // backoff floor while the server is down
+  const MAX_RETRY_MS = 15000;         // backoff ceiling
+  const FETCH_TIMEOUT_MS = 8000;      // treat a hung request as unreachable
+
+  const frame = document.getElementById("frame");
+  const overlay = document.getElementById("overlay");
+  const retryNote = document.getElementById("retry-note");
+  const urlBox = document.getElementById("url-box");
+  const toggleBtn = document.getElementById("toggle-url");
+  const retryBtn = document.getElementById("retry-now");
+  const hideBtn = document.getElementById("hide-url");
+
+  document.getElementById("url-text").textContent = DASHBOARD_URL;
+
+  let serverUp = null;          // null = not known yet
+  let retryDelay = MIN_RETRY_MS;
+  let checkTimer = null;
+  let nextCheckAt = 0;
+
+  function showDashboard() {
+    overlay.classList.add("hidden");
+    frame.classList.add("visible");
+  }
+
+  function showOverlay() {
+    frame.classList.remove("visible");
+    // Drop whatever the iframe was showing -- a now-dead dashboard, or a
+    // stale native "can't reach" page after the user refreshed inside the
+    // iframe -- so the ugly browser error never stays visible underneath.
+    if (frame.src && frame.src !== "about:blank") {
+      frame.src = "about:blank";
+    }
+    overlay.classList.remove("hidden");
+  }
+
+  function scheduleCheck(ms) {
+    clearTimeout(checkTimer);
+    nextCheckAt = Date.now() + ms;
+    checkTimer = setTimeout(runCheck, ms);
+  }
+
+  async function isReachable() {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      // no-cors: the dashboard is a different origin (the http VPS) than
+      // this wrapper (a local file://), so we can't read the response --
+      // we only need to know the request completed at the network level.
+      // Any HTTP reply (200/401/500) means "server is up"; only a real
+      // network failure (connection refused -- the screenshot case)
+      // rejects.
+      await fetch(DASHBOARD_URL, { mode: "no-cors", cache: "no-store", signal: ctl.signal });
+      return true;
+    } catch (e) {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function runCheck() {
+    const up = await isReachable();
+
+    if (up) {
+      if (serverUp !== true) {
+        // (Re)appeared: load the dashboard fresh and reveal it. This is
+        // the ONLY place we set frame.src on the way up, so once it's
+        // shown we never reload it from under the user (they may be on
+        // the Settings tab, or have refreshed the page themselves).
+        frame.src = DASHBOARD_URL;
+        showDashboard();
+        serverUp = true;
+      }
+      // Already up: leave the iframe untouched.
+      retryDelay = MIN_RETRY_MS;
+      scheduleCheck(HEALTHY_INTERVAL_MS);
+    } else {
+      serverUp = false;
+      showOverlay();
+      const delay = retryDelay;
+      retryDelay = Math.min(retryDelay * 2, MAX_RETRY_MS);
+      scheduleCheck(delay);
+    }
+  }
+
+  // Live countdown, only meaningful while the overlay is showing.
+  setInterval(() => {
+    if (overlay.classList.contains("hidden")) return;
+    const left = Math.max(0, Math.ceil((nextCheckAt - Date.now()) / 1000));
+    retryNote.textContent = left > 0 ? `Retrying automatically in ${left}s…` : "Checking…";
+  }, 250);
+
+  toggleBtn.addEventListener("click", () => {
+    const hidden = urlBox.hasAttribute("hidden");
+    if (hidden) {
+      urlBox.removeAttribute("hidden");
+      toggleBtn.textContent = "Hide dashboard address";
+    } else {
+      urlBox.setAttribute("hidden", "");
+      toggleBtn.textContent = "Show dashboard address";
+    }
+  });
+
+  hideBtn.addEventListener("click", () => {
+    urlBox.setAttribute("hidden", "");
+    toggleBtn.textContent = "Show dashboard address";
+  });
+
+  retryBtn.addEventListener("click", () => {
+    retryDelay = MIN_RETRY_MS;
+    scheduleCheck(0);
+  });
+
+  runCheck();
+</script>
+</body>
+</html>
