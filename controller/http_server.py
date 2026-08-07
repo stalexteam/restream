@@ -17,7 +17,6 @@ from urllib.parse import parse_qs, urlsplit
 import mediamtx_control
 import settings_store
 import ws
-from state_machine import STATE_OFFLINE
 
 _STATIC_CONTENT_TYPES = {
     "dashboard.css": "text/css; charset=utf-8",
@@ -210,20 +209,94 @@ def make_handler(controller, config: dict, hub, config_path: Path):
                 return
 
             command = message.get("command") if isinstance(message, dict) else None
-            if command == "stop_broadcast":
+            if command == "register_source":
+                # obs-source.html представляється при коннекті (з id своєї
+                # сесії OBS) -> hub рахує це з'єднання для індикатора Source,
+                # контролер оновлює "останню відому сесію". Якщо саме ця
+                # сесія заглушена (HALT) -- точково кажемо цьому джерелу
+                # зупинити OBS (кейс: source повернувся ПІСЛЯ обриву).
+                obs_id = message.get("obs_id")
+                hub.mark_source(self)
+                controller.report_obs_session(obs_id)
+                if controller.is_session_halted(obs_id):
+                    ws.send_text(self, json.dumps({"type": "control", "action": "stop_streaming"}), write_lock)
+            elif command == "stop_broadcast":
                 controller.on_manual_stop()
+            elif command == "halt":
+                controller.on_dashboard_halt()
             elif command == "obs_streaming_started":
+                # Реальний старт стриму OBS -> нова сесія з новим id.
+                controller.report_obs_session(message.get("obs_id"))
                 controller.on_obs_streaming_started()
             elif command == "get_settings":
                 self._handle_get_settings(write_lock)
             elif command == "save_settings":
                 self._handle_save_settings(message, write_lock)
+            elif command == "enable_output":
+                name = message.get("name")
+                if isinstance(name, str):
+                    controller.enable_destination(name)
+            elif command == "disable_output":
+                name = message.get("name")
+                if isinstance(name, str):
+                    controller.disable_destination(name)
+            elif command == "add_output":
+                self._handle_add_output(message, write_lock)
+            elif command == "update_output":
+                self._handle_update_output(message, write_lock)
+            elif command == "remove_output":
+                self._handle_remove_output(message, write_lock)
             else:
                 logging.warning("dashboard: unknown /ws command: %r", command)
 
+        def _output_names(self):
+            return [p["name"] for p in controller.outputs_for_settings()]
+
+        def _reply_output(self, ok: bool, errors: dict, write_lock):
+            ws.send_text(self, json.dumps({"type": "output_result", "ok": ok, "errors": errors}), write_lock)
+
         def _handle_get_settings(self, write_lock):
+            # System-поля + список площадок (server/key для модалки Modify,
+            # зібраний url для маскованого показу в списку).
             data = settings_store.load_editable(config_path)
+            data["platforms"] = controller.outputs_for_settings()
             ws.send_text(self, json.dumps({"type": "settings", "data": data}), write_lock)
+
+        def _handle_add_output(self, message: dict, write_lock):
+            name = (message.get("name") or "").strip()
+            server = (message.get("server") or "").strip()
+            key = (message.get("key") or "").strip()
+            errors = settings_store.validate_output(name, server, key, self._output_names())
+            if errors:
+                self._reply_output(False, errors, write_lock)
+                return
+            controller.add_destination(name, server, key)
+            self._reply_output(True, {}, write_lock)
+            self._handle_get_settings(write_lock)
+
+        def _handle_update_output(self, message: dict, write_lock):
+            old = message.get("name")
+            new_name = (message.get("new_name") or "").strip()
+            server = (message.get("server") or "").strip()
+            key = (message.get("key") or "").strip()
+            if not isinstance(old, str) or old not in self._output_names():
+                self._reply_output(False, {"_": "unknown platform"}, write_lock)
+                return
+            # rename дозволено на будь-яке вільне ім'я -> виключаємо власне старе
+            existing = [n for n in self._output_names() if n != old]
+            errors = settings_store.validate_output(new_name, server, key, existing)
+            if errors:
+                self._reply_output(False, errors, write_lock)
+                return
+            controller.update_destination(old, new_name, server, key)
+            self._reply_output(True, {}, write_lock)
+            self._handle_get_settings(write_lock)
+
+        def _handle_remove_output(self, message: dict, write_lock):
+            name = message.get("name")
+            if isinstance(name, str):
+                controller.remove_destination(name)
+            self._handle_get_settings(write_lock)
 
         def _handle_save_settings(self, message: dict, write_lock):
             values = message.get("settings")
@@ -234,49 +307,44 @@ def make_handler(controller, config: dict, hub, config_path: Path):
                 }), write_lock)
                 return
 
-            errors = settings_store.validate(values, controller.base_dir)
+            errors = settings_store.validate_system(values, controller.base_dir)
             if errors:
                 ws.send_text(self, json.dumps({
                     "type": "settings_saved", "ok": False, "errors": errors,
                 }), write_lock)
                 return
 
-            settings_store.save(config_path, values, controller.base_dir)
-            logging.info("dashboard: settings saved (twitch_url/offline_timeout_sec/backup_file/connect_timeout_ms/read_timeout_ms)")
+            # Тайминги MediaMTX (connect/read) неможливо застосувати без
+            # рестарту самого MediaMTX -- фіксуємо, чи вони змінились, ДО
+            # apply_settings (яке оновлює in-memory config). backup_file/
+            # offline_timeout apply_settings застосовує точково, живцем.
+            # (Площадки тут не при чому -- окремі negайні команди.)
+            old_connect = controller.config.get("connect_timeout_ms")
+            old_read = controller.config.get("read_timeout_ms")
+
+            controller.apply_settings(values)
+            logging.info("dashboard: system settings saved and applied (timeouts/backup)")
             ws.send_text(self, json.dumps({"type": "settings_saved", "ok": True}), write_lock)
 
-            if message.get("restart"):
+            new_connect = int(values["connect_timeout_ms"])
+            new_read = int(values["read_timeout_ms"])
+            if new_connect != old_connect or new_read != old_read:
                 current_state = controller.status()["state"]
-                if current_state != STATE_OFFLINE:
+                if current_state != "OFFLINE":
                     logging.warning(
-                        "dashboard: restarting while state=%s -- this ends the current broadcast",
+                        "dashboard: applying connect/read timeout while state=%s -- "
+                        "restarting MediaMTX ends the current broadcast",
                         current_state,
                     )
-                # MediaMTX -- ЗАВЖДИ, незалежно від того, які саме з
-                # 5 полів змінились: Apply & Restart і так уже означає
-                # "трансляція зараз обірветься", тож зайвий bounce
-                # MediaMTX нічого не змінює для глядача, а умовна
-                # логіка "лише якщо connect/read_timeout_ms
-                # змінились" -- складність, яку нема чим виправдати.
-                # Синхронно, ДО рестарту самого контролера -- інакше
-                # нове значення readTimeout ніколи не дійде до вже
-                # запущеного MediaMTX.
                 try:
                     mediamtx_control.sync_read_timeout(
-                        controller.base_dir / "mediamtx.yml",
-                        int(values["connect_timeout_ms"]),
-                        int(values["read_timeout_ms"]),
+                        controller.base_dir / "mediamtx.yml", new_connect, new_read,
                     )
                     mediamtx_control.restart_mediamtx(controller.base_dir)
                 except Exception:
-                    # Не вдалось перезапустити MediaMTX -- контролер
-                    # усе одно продовжує свій рестарт: краще мати
-                    # живий, досяжний контролер (з чіткою помилкою в
-                    # логах про MediaMTX), ніж обидва процеси мертві
-                    # без жодної можливості діагностики через веб.
-                    logging.exception("dashboard: failed to restart mediamtx alongside the controller")
-
-                if controller.request_restart is not None:
-                    controller.request_restart()
+                    # Не вдалось перезапустити MediaMTX -- краще живий,
+                    # досяжний контролер (з чіткою помилкою в логах про
+                    # MediaMTX), ніж обидва процеси мертві без діагностики.
+                    logging.exception("dashboard: failed to restart mediamtx after a timeout change")
 
     return Handler

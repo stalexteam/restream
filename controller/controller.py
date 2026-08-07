@@ -11,7 +11,6 @@
 
 import json
 import logging
-import os
 import signal
 import sys
 import threading
@@ -53,7 +52,7 @@ def main():
         ],
     )
 
-    controller = Controller(config, base_dir)
+    controller = Controller(config, base_dir, config_path)
     # DashboardHub потребує controller (щоб будувати знімки стану),
     # а Controller відповідно сповіщає hub про кожну зміну стану --
     # взаємна залежність, тому hub створюється вже ПІСЛЯ controller,
@@ -80,47 +79,19 @@ def main():
     handler_cls = make_handler(controller, config, hub, config_path)
     server = ThreadingHTTPServer((config["listen_host"], config["listen_port"]), handler_cls)
 
-    # ThreadingHTTPServer.daemon_threads = True -- кожен /ws-хендлер
-    # (звідки й приходить запит на рестарт, Settings -> Apply &
-    # Restart) виконується в daemon-потоці. Виконати сам os.execv()
-    # ПРЯМО звідти небезпечно: щойно server.shutdown() відпускає
-    # serve_forever() у головному потоці, той одразу добігає до кінця
-    # main() і завершує процес -- а разом з ним миттєво вбиваються всі
-    # daemon-потоки, включно з тим самим /ws-хендлером, який у цей
-    # момент, можливо, ще не встиг дійти до execv. Тому хендлер лише
-    # ПРОСИТЬ про рестарт (виставляє прапор і будить serve_forever())
-    # -- сам execv виконує ГОЛОВНИЙ потік, останньою дією перед тим,
-    # як він і так природно завершив би процес.
-    restart_requested = threading.Event()
-
-    def restart_process():
-        logging.info("restarting the controller process (settings applied via dashboard)")
-        hub.close_all()
-        restart_requested.set()
-        server.shutdown()
-
-    controller.request_restart = restart_process
-
     logging.info(
         "controller started on %s:%s (state=%s)",
         config["listen_host"], config["listen_port"], controller.state,
     )
+    # Дашборд застосовує зміни налаштувань точково, живцем (bounce лише
+    # зачепленого виходу / рестарт лише MediaMTX при зміні таймінгів) --
+    # самоперезапуску контролера через os.execv більше немає потреби.
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         controller.shutdown()
-
-    if restart_requested.is_set():
-        # Порт треба звільнити ДО execv -- інакше новий образ процесу
-        # (той самий PID) отримає "Address already in use": файлові
-        # дескриптори переживають execv (без явного CLOEXEC), і без
-        # цього виклику старий слухаючий сокет лишався б відкритим у
-        # тому самому процесі, SO_REUSEADDR тут не рятує (це не
-        # TIME_WAIT-кейс, а живий відкритий слухач).
-        server.server_close()
-        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":

@@ -113,16 +113,56 @@ h2 {
   min-width: 70px;
 }
 
+/* Аварійна кнопка HALT у шапці -- крайня справа. Активна лише під час
+   ефіру; вимкнена виглядає як приглушений контур. */
+.halt-button {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--red);
+  background: var(--red);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 16px;
+  letter-spacing: 0.04em;
+  padding: 4px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.halt-button:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.halt-button:disabled {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
 .bstate-offline { background: var(--gray); border-color: var(--gray); color: #fff; }
 .bstate-live { background: var(--green); border-color: var(--green); color: #0c1f13; }
+.bstate-idle { background: var(--blue); border-color: var(--blue); color: #fff; }
 .bstate-fallback { background: var(--orange); border-color: var(--orange); color: #1a1d21; }
 .bstate-halt { background: var(--red); border-color: var(--red); color: #fff; }
 
-#components {
+.panel {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 14px 16px;
+}
+
+.panel + .panel {
+  margin-top: 8px;
+}
+
+#obs-table th {
+  width: 64px;
+  text-transform: none;
+  font-size: 13px;
 }
 
 table {
@@ -154,6 +194,7 @@ tr:last-child td {
 
 /* Немає /ws-з'єднання -- дані застарілі, форма нічого не збереже. */
 body.ws-disconnected #tab-status,
+body.ws-disconnected #tab-control,
 body.ws-disconnected #tab-settings {
   filter: blur(0.8px);
   opacity: 0.6;
@@ -162,10 +203,6 @@ body.ws-disconnected #tab-settings {
 }
 
 #settings-form {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 16px;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -196,6 +233,24 @@ body.ws-disconnected #tab-settings {
 .field input:focus {
   outline: 2px solid var(--blue);
   outline-offset: -1px;
+}
+
+/* Чекбокс-поле: лейбл із чекбоксом в один рядок (не колонкою, як
+   текстові поля), чекбокс не розтягуємо на всю ширину. */
+.field-check label {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: var(--fg);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.field-check input {
+  width: auto;
+  flex: 0 0 auto;
+  margin: 0;
 }
 
 .masked-field {
@@ -244,11 +299,17 @@ body.ws-disconnected #tab-settings {
 }
 
 .actions button {
+  /* appearance:none -- інакше нативний <button> у деяких рушіях (CEF в
+     OBS зокрема) додає власні внутрішні метрики, і кнопка з фоном
+     (.primary) та без нього виходять різної висоти. */
+  appearance: none;
+  -webkit-appearance: none;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--fg);
   font: inherit;
   font-size: 13px;
+  line-height: 1.3;
   padding: 7px 14px;
   border-radius: 4px;
   cursor: pointer;
@@ -309,4 +370,262 @@ body.ws-disconnected #tab-settings {
 @keyframes toast-in {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+/* --- control tab --- */
+
+/* Фіксована розкладка -- колонки не "стрибають", коли значення
+   (uptime/ping/health/статус) міняють довжину щосекунди. Ширини задані
+   класами на th; Platform без ширини -> забирає решту. */
+#control-table {
+  table-layout: fixed;
+}
+
+#control-table th,
+#control-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;  /* усе по центру, крім першої колонки (Platform) */
+}
+
+#control-table th:first-child,
+#control-table td:first-child {
+  text-align: left;
+}
+
+.col-status { width: 104px; }
+.col-uptime { width: 72px; }
+.col-health { width: 140px; }
+.col-ping { width: 68px; }
+
+.control-toggle {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+}
+
+/* Колонка Platform: чекбокс + назва в один рядок. */
+.cell-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pf-label {
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pill {
+  display: inline-block;
+  /* Єдина ширина бейджів (по найдовшому тексту "Connecting"), щоб
+     колонка Status не міняла розкладку при зміні статусу. */
+  min-width: 84px;
+  box-sizing: border-box;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 15px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.pill-live { color: var(--green); border-color: var(--green); }
+.pill-connecting { color: var(--orange); border-color: var(--orange); }
+.pill-failed { color: var(--red); border-color: var(--red); }
+.pill-off { color: var(--muted); }
+
+.hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 10px 0 0;
+  line-height: 1.4;
+}
+
+/* --- settings: platforms list --- */
+
+.platform-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.platform-row:last-child {
+  border-bottom: none;
+}
+
+.platform-name {
+  flex: 0 0 22%;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.platform-url {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Розкритий URL (кнопка Show) -- лишається в ОДИН рядок (щоб висота
+   рядка не стрибала), але горизонтально прокручуваний і виділюваний
+   одним кліком: user-select:all виділяє весь текст цілком, навіть
+   прокручену частину, тож копіюється повністю. */
+.platform-url.revealed {
+  white-space: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  text-overflow: clip;
+  color: var(--fg);
+  user-select: all;
+  -webkit-user-select: all;
+}
+
+.icon-button {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 0 0 auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.3;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  color: var(--fg);
+  border-color: var(--muted);
+}
+
+.pf-delete:hover {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+/* Фіксована ширина кнопки-перемикача, щоб текст Show/Hide не міняв її
+   ширину (і, відповідно, розкладку рядка). */
+.pf-show {
+  min-width: 56px;
+  text-align: center;
+}
+
+/* Тонкий сучасний горизонтальний скролбар для розкритого url і превʼю
+   (нативний -- зависокий). Firefox -- scrollbar-*; WebKit/CEF -- ::-webkit. */
+.platform-url.revealed,
+.preview {
+  scrollbar-width: thin;
+  scrollbar-color: var(--gray) transparent;
+}
+
+.platform-url.revealed::-webkit-scrollbar,
+.preview::-webkit-scrollbar {
+  height: 6px;
+}
+
+.platform-url.revealed::-webkit-scrollbar-track,
+.preview::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.platform-url.revealed::-webkit-scrollbar-thumb,
+.preview::-webkit-scrollbar-thumb {
+  background: var(--gray);
+  border-radius: 3px;
+}
+
+.platform-url.revealed::-webkit-scrollbar-thumb:hover,
+.preview::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+/* --- add/modify modal --- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;  /* 16px margin around the modal on every side */
+}
+
+.modal-overlay[hidden] {
+  display: none;
+}
+
+.modal {
+  width: 100%;  /* майже на всю ширину -- лишає лише 16px overlay-паддінгу по боках */
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.preview {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 7px 9px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--fg);
+  /* Один рядок + горизонтальний скрол + виділення одним кліком, як у
+     розкритого url у списку -- висота не стрибає, копіюється повністю. */
+  white-space: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  user-select: all;
+  -webkit-user-select: all;
+}
+
+.ghost-button {
+  appearance: none;
+  -webkit-appearance: none;
+  align-self: flex-start;
+  margin-top: 10px;
+  background: transparent;
+  border: 1px solid var(--blue);
+  border-radius: 4px;
+  color: var(--blue);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  padding: 7px 14px;
+  cursor: pointer;
+}
+
+.ghost-button:hover {
+  background: var(--blue);
+  color: #fff;
+}
+
+.field-row {
+  display: flex;
+  justify-content: flex-end;
 }

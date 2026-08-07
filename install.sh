@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 #
-# Встановлення restream-controller: ffmpeg, MediaMTX, конфігурація з
-# автогенерованими паролями, (опційно) systemd-юніти.
+# Встановлення restream-controller: ffmpeg, MediaMTX, конфігурація з автогенерованими паролями, (опційно) systemd-юніти.
 #
-# Розрахований на Debian/Ubuntu (apt). Ідемпотентний: повторний запуск
-# не перезаписує вже створені config.json / mediamtx.yml, щоб не
-# затерти ваші ручні правки (twitch_url, backup_file тощо).
+# Розрахований на Debian/Ubuntu (apt). Ідемпотентний: повторний запуск не перезаписує вже створені config.json / mediamtx.yml, щоб не затерти ваші ручні правки (primary_server/primary_key, restreams, backup_file тощо).
 
 set -euo pipefail
 
@@ -14,9 +11,9 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Project directory: ${BASE_DIR}"
 
-echo "==> Installing system packages (ffmpeg, python3, curl, openssl)"
+echo "==> Installing system packages (ffmpeg, python3, curl)"
 sudo apt-get update -qq
-sudo apt-get install -y -qq ffmpeg python3 curl ca-certificates openssl
+sudo apt-get install -y -qq ffmpeg python3 curl ca-certificates
 
 mkdir -p "${BASE_DIR}/bin" "${BASE_DIR}/backup" "${BASE_DIR}/controller"
 chmod +x "${BASE_DIR}/restreamctl.sh" 2>/dev/null || true
@@ -34,7 +31,8 @@ else
 fi
 
 gen_secret() {
-  openssl rand -hex 16
+  # python3 і так обов'язкова залежність -- окремий openssl лише заради рандомного hex-ключа не потрібен (secrets -- CSPRNG зі stdlib).
+  python3 -c "import secrets; print(secrets.token_hex(16))"
 }
 
 if [ ! -f "${BASE_DIR}/mediamtx.yml" ]; then
@@ -53,8 +51,7 @@ fi
 if [ ! -f "${BASE_DIR}/controller/config.json" ]; then
   echo "==> Creating controller/config.json"
   DASHBOARD_TOKEN="$(gen_secret)"
-  # INTERNAL_PASS має збігатися з тим, що потрапив у mediamtx.yml саме
-  # цього запуску — якщо mediamtx.yml вже існував, беремо пароль звідти.
+  # INTERNAL_PASS має збігатися з тим, що потрапив у mediamtx.yml саме цього запуску — якщо mediamtx.yml вже існував, беремо пароль звідти.
   if [ "${INTERNAL_PASS}" = "(already set in mediamtx.yml)" ]; then
     INTERNAL_PASS="$(grep -A1 'user: internal' "${BASE_DIR}/mediamtx.yml" | grep 'pass:' | awk '{print $2}')"
   fi
@@ -69,18 +66,10 @@ else
   DASHBOARD_TOKEN="(already set in controller/config.json)"
 fi
 
-# public_host -- операційна адреса, не секрет (на відміну від
-# паролів/токена вище): могла змінитись (переїзд на інший VPS, зміна
-# DNS), тож питаємо ЩОРАЗУ, а не лише при першому створенні
-# config.json. Оновлюємо ЛИШЕ це одне поле в уже наявному файлі --
-# не перегенеровуємо його з шаблону повністю, щоб не затерти ручні
-# правки twitch_url/backup_file/тощо.
+# public_host -- операційна адреса, не секрет (на відміну від паролів/токена вище): могла змінитись (переїзд на інший VPS, зміна DNS), тож питаємо ЩОРАЗУ, а не лише при першому створенні config.json. Оновлюємо ЛИШЕ це одне поле в уже наявному файлі -- не перегенеровуємо його з шаблону повністю, щоб не затерти ручні правки primary_server/primary_key/restreams/backup_file/тощо.
 CURRENT_PUBLIC_HOST="$(python3 -c "import json; print(json.load(open('${BASE_DIR}/controller/config.json')).get('public_host','') or '')" 2>/dev/null)"
 [ "${CURRENT_PUBLIC_HOST}" = "YOUR_VPS_IP" ] && CURRENT_PUBLIC_HOST=""
-# `|| true` -- без stdin (напр. `curl ... | bash`) read повертає
-# ненульовий код на EOF, і `set -e` обірвав би install.sh на цьому
-# місці; порожній ввід і так коректно падає до попереднього/дефолтного
-# значення нижче.
+# `|| true` -- без stdin (напр. `curl ... | bash`) read повертає ненульовий код на EOF, і `set -e` обірвав би install.sh на цьому місці; порожній ввід і так коректно падає до попереднього/дефолтного значення нижче.
 read -rp "Public IP or hostname of this server [${CURRENT_PUBLIC_HOST:-leave empty to fill in later}]: " PUBLIC_HOST_INPUT || true
 PUBLIC_HOST="${PUBLIC_HOST_INPUT:-${CURRENT_PUBLIC_HOST:-YOUR_VPS_IP}}"
 python3 -c "
@@ -96,8 +85,7 @@ with open(tmp, 'w') as f:
 os.replace(tmp, path)
 "
 
-# Read the values needed both for the local files generated below and
-# for the printed instructions at the end.
+# Read the values needed both for the local files generated below and for the printed instructions at the end.
 read -r GEN_PUBLIC_HOST GEN_DASHBOARD_TOKEN GEN_PORT <<< "$(python3 -c "
 import json
 c = json.load(open('${BASE_DIR}/controller/config.json'))
@@ -106,20 +94,7 @@ print(c.get('public_host', 'YOUR_VPS_IP'), c.get('dashboard_token', ''), c.get('
 DASHBOARD_URL="http://${GEN_PUBLIC_HOST}:${GEN_PORT}/dashboard?token=${GEN_DASHBOARD_TOKEN}"
 OBS_WS_URL="ws://${GEN_PUBLIC_HOST}:${GEN_PORT}/ws?token=${GEN_DASHBOARD_TOKEN}"
 
-# Two local files the user copies to the OBS machine (both regenerated on
-# every run -- unlike config.json/mediamtx.yml they have no hand edits
-# worth preserving, and the embedded URL changes with public_host/token).
-# No `&` or `#` in these URLs (single hex-token query param), so a plain
-# sed substitution is safe.
-#   obs-dock.html   -- Custom Browser Dock: holds the dashboard in an
-#                      iframe with a "retrying…" screen while the server
-#                      is unreachable (instead of OBS's bare "Couldn't
-#                      load that page").
-#   obs-source.html -- Browser Source (in a scene): standalone tracker
-#                      that talks to /ws directly. Loading it as a local
-#                      file:// keeps window.obsstudio reliable and lets
-#                      the /ws URL be baked in (location.host is empty in
-#                      file://).
+# Two local files the user copies to the OBS machine (both regenerated on every run -- unlike config.json/mediamtx.yml they have no hand edits worth preserving, and the embedded URL changes with public_host/token). No `&` or `#` in these URLs (single hex-token query param), so a plain sed substitution is safe. obs-dock.html   -- Custom Browser Dock: holds the dashboard in an iframe with a "retrying…" screen while the server is unreachable (instead of OBS's bare "Couldn't load that page"). obs-source.html -- Browser Source (in a scene): standalone tracker that talks to /ws directly. Loading it as a local file:// keeps window.obsstudio reliable and lets the /ws URL be baked in (location.host is empty in file://).
 sed \
   -e "s#__DASHBOARD_URL__#${DASHBOARD_URL}#g" \
   "${BASE_DIR}/controller/obs-dock.html.template" > "${BASE_DIR}/obs-dock.html"
@@ -127,11 +102,7 @@ sed \
   -e "s#__WS_URL__#${OBS_WS_URL}#g" \
   "${BASE_DIR}/controller/obs-source.html.template" > "${BASE_DIR}/obs-source.html"
 
-# Restrict the secret-bearing files to the owner: mediamtx.yml (RTMP
-# passwords), config.json (dashboard token + internal password), and the
-# two generated OBS files (dashboard URL/WS URL with the token). Harmless
-# on a single-user VPS, important on a shared one. `|| true` -- never let
-# a chmod failure abort the install.
+# Restrict the secret-bearing files to the owner: mediamtx.yml (RTMP passwords), config.json (dashboard token + internal password), and the two generated OBS files (dashboard URL/WS URL with the token). Harmless on a single-user VPS, important on a shared one. `|| true` -- never let a chmod failure abort the install.
 chmod 600 \
   "${BASE_DIR}/mediamtx.yml" \
   "${BASE_DIR}/controller/config.json" \
@@ -144,10 +115,7 @@ if [ ! -f "${BASE_DIR}/backup/backup.mp4" ]; then
   echo "    the path in controller/config.json (backup_file field)."
 fi
 
-# Читаємо пароль напряму з mediamtx.yml (той самий підхід, що вже й
-# так у restreamctl.sh credentials), а не з OBS_PASS цього запуску --
-# інакше при вже наявному mediamtx.yml тут був би лише текст-заглушка
-# "see mediamtx.yml", а не реальне значення, яке можна скопіювати.
+# Читаємо пароль напряму з mediamtx.yml (той самий підхід, що вже й так у restreamctl.sh credentials), а не з OBS_PASS цього запуску -- інакше при вже наявному mediamtx.yml тут був би лише текст-заглушка "see mediamtx.yml", а не реальне значення, яке можна скопіювати.
 FINAL_OBS_PASS="$(grep -A2 'user: obs' "${BASE_DIR}/mediamtx.yml" | grep 'pass:' | awk '{print $2}')"
 
 BOLD="\033[1m"
@@ -169,9 +137,10 @@ echo "  3. Add the dashboard as an OBS -> Docks -> Custom Browser Dock."
 echo "     Copy this generated file to the OBS machine and point the dock"
 echo "     at it via a local file path (see README step 7 for details):"
 echo -e "       ${BOLD}${CYAN}${BASE_DIR}/obs-dock.html${RESET}"
-echo "     On its Settings tab, set the Twitch RTMP URL + your Stream Key"
-echo "     (Twitch Creator Dashboard -> Settings -> Stream -> Primary Stream"
-echo "     Key) and hit Apply & Restart."
+echo "     On its Settings tab, set the primary platform's RTMP URL + stream"
+echo "     key (e.g. Twitch: Creator Dashboard -> Settings -> Stream), add any"
+echo "     extra restream platforms, and hit Apply. Use the Control tab to"
+echo "     toggle each platform on/off live."
 echo "  4. Configure OBS -> Settings -> Stream -> Service: \"Custom...\":"
 echo -e "       Server:      ${BOLD}${CYAN}rtmp://${GEN_PUBLIC_HOST}:1935/live${RESET}"
 echo -e "       Stream Key:  ${BOLD}${CYAN}main?user=obs&pass=${FINAL_OBS_PASS}${RESET}"

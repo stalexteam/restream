@@ -27,6 +27,9 @@ class DashboardHub:
         self._base_dir = base_dir
         self._lock = threading.Lock()
         self._connections: dict[object, threading.Lock] = {}
+        # Підмножина _connections, що представилась як obs-source.html
+        # (команда register_source) -- для індикатора "Source" у шапці.
+        self._source_handlers: set = set()
         self._last_snapshot: dict | None = None
         self._event = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
@@ -59,6 +62,7 @@ class DashboardHub:
                     dead.append(handler)
             for handler in dead:
                 self._connections.pop(handler, None)
+                self._source_handlers.discard(handler)
 
     def register(self, handler) -> threading.Lock:
         """
@@ -80,30 +84,20 @@ class DashboardHub:
             self._send(handler, write_lock, {"type": "full", "data": snapshot})
         return write_lock
 
+    def mark_source(self, handler) -> None:
+        """obs-source.html представився (register_source) -- рахуємо його зʼєднання для індикатора Source."""
+        with self._lock:
+            self._source_handlers.add(handler)
+        self.notify()
+
     def unregister(self, handler) -> None:
         """Ідемпотентно -- безпечно викликати і з read-циклу з'єднання, і з hub-а."""
         with self._lock:
             self._connections.pop(handler, None)
-
-    def close_all(self) -> None:
-        """
-        Перед self-рестартом контролера (Settings -> Apply & Restart):
-        шле CLOSE усім відкритим /ws-з'єднанням і закриває їхні сокети
-        одразу, замість того, щоб лишити їх висіти на фактично
-        мертвому fd після заміни образу процесу (`os.execv`) -- клієнт
-        одразу бачить розрив і йде у вже готовий reconnect-з-бекофом.
-        """
-        with self._lock:
-            for handler, write_lock in self._connections.items():
-                try:
-                    ws.send_close(handler, write_lock)
-                except OSError:
-                    pass
-                try:
-                    handler.connection.close()
-                except OSError:
-                    pass
-            self._connections.clear()
+            was_source = handler in self._source_handlers
+            self._source_handlers.discard(handler)
+        if was_source:
+            self.notify()  # оновити індикатор Source одразу
 
     def _run(self) -> None:
         while True:
@@ -128,6 +122,7 @@ class DashboardHub:
                     dead.append(handler)
             for handler in dead:
                 self._connections.pop(handler, None)
+                self._source_handlers.discard(handler)
 
     def _send(self, handler, write_lock, message: dict) -> bool:
         return self._send_raw(handler, write_lock, json.dumps(message))
@@ -157,9 +152,20 @@ class DashboardHub:
             "controller": self._component(os.getpid()),
             "relay": self._component(status.pop("relay_pid")),
             "backup": self._component(status.pop("backup_pid")),
-            "outbound": self._component(status.pop("outbound_pid")),
         }
         status["components"] = components
+        # Чи підключений зараз хоч один obs-source.html (індикатор Source).
+        # Читання set поза self._lock -- best-effort, атомарне під GIL.
+        status["obs_source_connected"] = bool(self._source_handlers)
+        # Кожен вихід -- окремий ffmpeg-процес; збагачуємо його рядок
+        # CPU/RSS так само, як компоненти (список destinations уже несе
+        # name/enabled/статус/дропи/ping зі state_machine.status()).
+        for dest in status.get("destinations", []):
+            pid = dest.get("pid")
+            running = pid is not None and self._pid_alive(pid)
+            stats = proc_stats.sample(pid) if running else None
+            dest["cpu_percent"] = stats["cpu_percent"] if stats else None
+            dest["rss_mb"] = stats["rss_mb"] if stats else None
         return status
 
     @staticmethod

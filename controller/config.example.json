@@ -1,5 +1,5 @@
 {
-  "_comment": "This is an example config. install.sh creates a working controller/config.json with passwords filled in. The twitch_url and backup_file fields need to be edited manually.",
+  "_comment": "This is an example config. install.sh creates a working controller/config.json with passwords filled in. Set your platform(s) and the backup_file via the dashboard Settings tab (or edit primary_server/primary_key/restreams and backup_file here by hand).",
 
   "listen_host": "0.0.0.0",
   "listen_port": 8790,
@@ -17,7 +17,12 @@
 
   "backup_file": "__BASE_DIR__/backup/backup.mp4",
 
-  "twitch_url": "rtmp://live.twitch.tv/app/CHANGE_ME_STREAM_KEY",
+  "_comment_outputs": "Platforms are managed from the dashboard Settings tab (add/edit/remove) and Control tab (on/off) -- easier than editing here. Each platform stores server + key separately (exactly the two fields a platform gives you, e.g. OBS's Server + Stream Key); the controller joins them into the push URL and auto-adds :443/app for Kick/AWS IVS (*.live-video.net). Both rtmp:// and rtmps:// work. primary is the mandatory main platform (can't be removed); restreams are extra, toggleable ones. The 'enabled' flags are managed by the Control tab. Aggregate failsafe: the broadcast is stopped hard only if NONE of the enabled platforms can be reached at start; if at least one connects, failed ones just retry/toast.",
+  "primary_name": "primary",
+  "primary_server": "rtmp://live.twitch.tv/app",
+  "primary_key": "CHANGE_ME_STREAM_KEY",
+  "primary_enabled": true,
+  "restreams": [],
 
   "_comment_output": "The controller determines the backup video's resolution/fps/channels itself via ffprobe of the live stream on every broadcast start -- no need to set them here. These two fields only affect the QUALITY of the one-time backup transcode (when it doesn't match live): the video/audio bitrate of the resulting backup.prepared.mp4.",
   "output_video_bitrate_kbps": 6000,
@@ -28,6 +33,9 @@
   "_comment_timeouts": "Two-phase silent-drop detection (CLAUDE.md, v12/v14). connect_timeout_ms: how long to wait for OBS's first frame after it connects (MediaMTX's own readTimeout, minimum 2500 -- real OBS needs several seconds for encoder warm-up + first keyframe, longer than a synthetic test source). read_timeout_ms: once data is flowing, how fast to react to a stalled network without dropping the OBS connection (minimum 300). mediamtx.yml's readTimeout is recalculated as their sum on every MediaMTX start -- don't edit it there directly.",
   "connect_timeout_ms": 5000,
   "read_timeout_ms": 500,
+
+  "_comment_icmp_ping": "Control tab Ping column: false (default) = TCP-connect time to the platform's RTMP/RTMPS port (works without privileges); true = system ICMP ping (avg RTT), closer to a classic ping but may be blocked by a firewall or need privileges (the ping binary must allow a normal user -- see README) -- if it fails the column shows a dash. Toggle it on the Settings tab.",
+  "icmp_ping": false,
 
   "log_file": "__BASE_DIR__/controller/controller.log"
 }

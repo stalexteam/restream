@@ -12,16 +12,31 @@
 <header>
   <nav id="tab-nav" class="tabs">
     <button type="button" class="tab-button active" data-tab="status">Status</button>
+    <button type="button" class="tab-button" data-tab="control">Control</button>
     <button type="button" class="tab-button" data-tab="settings">Settings</button>
   </nav>
   <div class="indicators">
     <div id="ws-indicator" class="indicator ind-connecting" title="Connecting…">WS</div>
+    <div id="source-indicator" class="indicator ind-connecting" title="OBS browser-source not connected">SRC</div>
+    <div id="obs-indicator" class="indicator ind-connecting" title="No live data from OBS">OBS</div>
     <div id="broadcast-indicator" class="indicator bstate-offline">Offline</div>
+    <button type="button" id="halt-btn" class="halt-button" title="Stop the broadcast on all platforms and tell OBS to stop" disabled>HALT</button>
   </div>
 </header>
 
 <section id="tab-status" class="tab-panel">
-  <div id="components">
+  <div id="obs-input" class="panel">
+    <h2>OBS input</h2>
+    <table id="obs-table">
+      <tbody>
+        <tr><th>Data</th><td id="obs-data">–</td></tr>
+        <tr><th>Video</th><td id="obs-video">–</td></tr>
+        <tr><th>Audio</th><td id="obs-audio">–</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div id="components" class="panel">
     <h2>Components</h2>
     <table id="components-table">
       <thead>
@@ -32,44 +47,103 @@
   </div>
 </section>
 
-<section id="tab-settings" class="tab-panel" hidden>
-  <form id="settings-form">
-    <div class="field">
-      <label for="field-twitch-url">Twitch RTMP URL (includes your stream key)</label>
-      <div class="masked-field">
-        <input type="password" id="field-twitch-url" name="twitch_url" autocomplete="off" spellcheck="false">
-        <button type="button" id="toggle-twitch-url" class="reveal-toggle">Show</button>
-      </div>
-    </div>
-
-    <div class="field">
-      <label for="field-backup">Backup video path (on the VPS)</label>
-      <input type="text" id="field-backup" name="backup_file" autocomplete="off" spellcheck="false">
-    </div>
-
-    <div class="field">
-      <label for="field-connect-timeout">Connect timeout (ms) -- wait for OBS's first frame</label>
-      <input type="number" id="field-connect-timeout" name="connect_timeout_ms" min="2500" step="1">
-    </div>
-
-    <div class="field">
-      <label for="field-read-timeout">Read timeout (ms) -- react to a stalled network once live</label>
-      <input type="number" id="field-read-timeout" name="read_timeout_ms" min="300" step="1">
-    </div>
-
-    <div class="field">
-      <label for="field-offline-timeout">Offline timeout (seconds)</label>
-      <input type="number" id="field-offline-timeout" name="offline_timeout_sec" min="60" step="1">
-    </div>
-
-    <div id="settings-errors" class="errors" hidden></div>
-
-    <div class="actions">
-      <button type="button" id="btn-apply">Apply</button>
-      <button type="button" id="btn-apply-restart" class="primary">Apply &amp; Restart</button>
-    </div>
-  </form>
+<section id="tab-control" class="tab-panel" hidden>
+  <div class="panel">
+    <table id="control-table">
+      <thead>
+        <tr>
+          <th>Platform</th>
+          <th class="col-status">Status</th>
+          <th class="col-uptime">Uptime</th>
+          <th class="col-health">Health</th>
+          <th class="col-ping">Ping</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
 </section>
+
+<section id="tab-settings" class="tab-panel" hidden>
+  <div class="panel">
+    <h2>Platforms</h2>
+    <div id="platforms-list"></div>
+    <button type="button" id="btn-add-platform" class="ghost-button">+ Add platform</button>
+  </div>
+
+  <div class="panel">
+    <h2>System settings</h2>
+    <form id="settings-form">
+      <div class="field">
+        <label for="field-backup">Backup video path (on the VPS)</label>
+        <input type="text" id="field-backup" name="backup_file" autocomplete="off" spellcheck="false">
+      </div>
+
+      <div class="field">
+        <label for="field-connect-timeout">Connect timeout (ms) -- wait for OBS's first frame</label>
+        <input type="number" id="field-connect-timeout" name="connect_timeout_ms" min="2500" step="1">
+      </div>
+
+      <div class="field">
+        <label for="field-read-timeout">Read timeout (ms) -- react to a stalled network once live</label>
+        <input type="number" id="field-read-timeout" name="read_timeout_ms" min="300" step="1">
+      </div>
+
+      <div class="field">
+        <label for="field-offline-timeout">Offline timeout (seconds)</label>
+        <input type="number" id="field-offline-timeout" name="offline_timeout_sec" min="60" step="1">
+      </div>
+
+      <div class="field field-check">
+        <label for="field-icmp-ping"><input type="checkbox" id="field-icmp-ping" name="icmp_ping"> Use ICMP ping for the Control tab (off = TCP-connect time; ICMP may be blocked/need privileges)</label>
+      </div>
+
+      <div id="settings-errors" class="errors" hidden></div>
+
+      <div class="actions">
+        <button type="button" id="btn-apply" class="primary">Apply</button>
+      </div>
+      <p class="hint">Backup path and offline timeout apply without interrupting. Changing the connect/read timeouts restarts MediaMTX and ends the current broadcast (you'll be asked to confirm).</p>
+    </form>
+  </div>
+</section>
+
+<div id="platform-modal" class="modal-overlay" hidden>
+  <div class="modal">
+    <h2 id="platform-modal-title">Add platform</h2>
+    <div class="field">
+      <label for="modal-name">Name</label>
+      <input type="text" id="modal-name" placeholder="e.g. Kick" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="modal-server">Server URL (the platform's ingest URL)</label>
+      <input type="text" id="modal-server" placeholder="rtmp://… or rtmps://…" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="modal-key">Stream key</label>
+      <input type="text" id="modal-key" placeholder="your stream key" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label>Final push URL (built automatically)</label>
+      <div id="modal-preview" class="preview">–</div>
+    </div>
+    <div id="modal-errors" class="errors" hidden></div>
+    <div class="actions">
+      <button type="button" id="modal-cancel">Cancel</button>
+      <button type="button" id="modal-ok" class="primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<template id="platform-row-template">
+  <div class="platform-row">
+    <span class="platform-name"></span>
+    <span class="platform-url"></span>
+    <button type="button" class="pf-show icon-button" title="Show / hide URL">Show</button>
+    <button type="button" class="pf-edit icon-button" title="Modify">Modify</button>
+    <button type="button" class="pf-delete icon-button" title="Delete">Delete</button>
+  </div>
+</template>
 
 <script src="dashboard.js"></script>
 </body>

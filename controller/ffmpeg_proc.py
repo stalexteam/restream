@@ -105,6 +105,11 @@ class FfmpegProcess:
         self._monitor_thread: threading.Thread | None = None
         self._consecutive_early_exits = 0
         self._ever_ran_long = False
+        # Метрики для дашборда (Control): скільки разів супервізор
+        # перезапускав процес від останнього start(), і коли стартував
+        # поточний живий процес (для аптайму).
+        self._restart_count = 0
+        self._started_at: float | None = None
 
     def _resolve_args(self) -> list[str]:
         return self.args() if callable(self.args) else self.args
@@ -122,6 +127,17 @@ class FfmpegProcess:
         with self._lock:
             return self._ever_ran_long
 
+    def restart_count(self) -> int:
+        with self._lock:
+            return self._restart_count
+
+    def uptime_sec(self) -> float:
+        """Скільки триває поточний живий запуск (0, якщо не працює)."""
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None or self._started_at is None:
+                return 0.0
+            return time.monotonic() - self._started_at
+
     def start(self):
         with self._lock:
             if self._desired:
@@ -129,6 +145,8 @@ class FfmpegProcess:
             self._desired = True
             self._consecutive_early_exits = 0
             self._ever_ran_long = False
+            self._restart_count = 0
+            self._started_at = None
         self._monitor_thread = threading.Thread(target=self._run_supervised, daemon=True)
         self._monitor_thread.start()
 
@@ -209,6 +227,7 @@ class FfmpegProcess:
                         stdin=subprocess.PIPE if self.stdin_pipe else subprocess.DEVNULL,
                     )
                     proc = self._proc
+                    self._started_at = time.monotonic()
                 self._fire_on_start(proc)
 
                 started_at = time.monotonic()
@@ -257,6 +276,8 @@ class FfmpegProcess:
                     if not self._desired:
                         return
 
+                with self._lock:
+                    self._restart_count += 1
                 logging.warning(
                     "ffmpeg[%s] exited unexpectedly, restarting in %.1fs",
                     self.name, RESTART_BACKOFF_SEC,

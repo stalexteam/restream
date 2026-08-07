@@ -15,6 +15,17 @@ MEDIAMTX_PID_FILE="${BASE_DIR}/.mediamtx.pid"
 CONTROLLER_PID_FILE="${BASE_DIR}/.controller.pid"
 MEDIAMTX_LOG="${BASE_DIR}/mediamtx.log"
 
+# Кольорові статус-мітки -- лише коли stdout це термінал, інакше порожні
+# (щоб `check`/`status` у файл/пайп лишались без ESC-сміття).
+if [ -t 1 ]; then
+  _c_green=$'\033[32m'; _c_yellow=$'\033[33m'; _c_red=$'\033[31m'; _c_reset=$'\033[0m'
+else
+  _c_green=; _c_yellow=; _c_red=; _c_reset=
+fi
+TAG_OK="${_c_green}[OK]${_c_reset}"
+TAG_WARN="${_c_yellow}[WARNING]${_c_reset}"
+TAG_ERR="${_c_red}[ERROR]${_c_reset}"
+
 # Читає одне поле з controller/config.json (через python3 — уникаємо
 # залежності від jq).
 cfg() {
@@ -47,14 +58,14 @@ sync_mediamtx_read_timeout() {
 
   if [ -z "${connect_ms}" ] || ! [ "${connect_ms}" -ge "${MIN_CONNECT_TIMEOUT_MS}" ] 2>/dev/null; then
     if [ -n "${connect_ms}" ]; then
-      echo "[WARNING] connect_timeout_ms (${connect_ms}) is below the minimum (${MIN_CONNECT_TIMEOUT_MS}ms) -- using ${MIN_CONNECT_TIMEOUT_MS}ms"
+      echo "${TAG_WARN} connect_timeout_ms (${connect_ms}) is below the minimum (${MIN_CONNECT_TIMEOUT_MS}ms) -- using ${MIN_CONNECT_TIMEOUT_MS}ms"
     fi
     connect_ms="${MIN_CONNECT_TIMEOUT_MS}"
   fi
 
   if [ -z "${read_ms}" ] || ! [ "${read_ms}" -ge "${MIN_READ_TIMEOUT_MS}" ] 2>/dev/null; then
     if [ -n "${read_ms}" ]; then
-      echo "[WARNING] read_timeout_ms (${read_ms}) is below the minimum (${MIN_READ_TIMEOUT_MS}ms) -- using ${MIN_READ_TIMEOUT_MS}ms"
+      echo "${TAG_WARN} read_timeout_ms (${read_ms}) is below the minimum (${MIN_READ_TIMEOUT_MS}ms) -- using ${MIN_READ_TIMEOUT_MS}ms"
     fi
     read_ms="${MIN_READ_TIMEOUT_MS}"
   fi
@@ -71,42 +82,47 @@ cmd_check() {
   echo "== Configuration check =="
 
   if [ ! -f "${CONFIG}" ]; then
-    echo "[ERROR] controller/config.json not found -- run ./install.sh first"
+    echo "${TAG_ERR} controller/config.json not found -- run ./install.sh first"
     return 1
   fi
-  echo "[OK] controller/config.json found"
+  echo "${TAG_OK} controller/config.json found"
 
   if [ ! -f "${MEDIAMTX_YML}" ]; then
-    echo "[ERROR] mediamtx.yml not found -- run ./install.sh first"
+    echo "${TAG_ERR} mediamtx.yml not found -- run ./install.sh first"
     has_error=1
   else
-    echo "[OK] mediamtx.yml found"
+    echo "${TAG_OK} mediamtx.yml found"
   fi
 
   if [ ! -x "${MEDIAMTX_BIN}" ]; then
-    echo "[ERROR] bin/mediamtx not found -- run ./install.sh first"
+    echo "${TAG_ERR} bin/mediamtx not found -- run ./install.sh first"
     has_error=1
   else
-    echo "[OK] bin/mediamtx found"
+    echo "${TAG_OK} bin/mediamtx found"
   fi
 
-  local twitch_url backup_file
-  twitch_url="$(cfg twitch_url)"
+  local primary_server primary_key backup_file
+  # primary is stored as server+key; fall back to the old single-URL
+  # fields (installs from before the split) for the "is it set?" check.
+  primary_server="$(cfg primary_server)"
+  [ -z "${primary_server}" ] && primary_server="$(cfg primary_url)"
+  [ -z "${primary_server}" ] && primary_server="$(cfg twitch_url)"
+  primary_key="$(cfg primary_key)"
   backup_file="$(cfg backup_file)"
 
-  if [ "${twitch_url}" = "rtmp://live.twitch.tv/app/CHANGE_ME_STREAM_KEY" ] || [ -z "${twitch_url}" ]; then
-    echo "[WARNING] twitch_url in controller/config.json hasn't been changed to a real Twitch key yet"
+  if [ "${primary_key}" = "CHANGE_ME_STREAM_KEY" ] || [ -z "${primary_server}" ]; then
+    echo "${TAG_WARN} primary platform isn't set yet -- set its server URL + stream key in the dashboard Settings tab"
   else
-    echo "[OK] twitch_url is set"
+    echo "${TAG_OK} primary platform is set"
   fi
 
   if [ -z "${backup_file}" ] || [ ! -f "${backup_file}" ]; then
-    echo "[ERROR] Backup video file not found: '${backup_file}'"
+    echo "${TAG_ERR} Backup video file not found: '${backup_file}'"
     echo "        Place a video file at this path, or change"
     echo "        backup_file in controller/config.json."
     has_error=1
   else
-    echo "[OK] Backup video file found: ${backup_file}"
+    echo "${TAG_OK} Backup video file found: ${backup_file}"
     if command -v ffprobe >/dev/null 2>&1; then
       # УВАГА: це перевірка лише "ffprobe взагалі бачить відео- й
       # аудіодоріжку і зчитав кодек" — файл читається і не зіпсований.
@@ -120,15 +136,15 @@ cmd_check() {
       vcodec="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "${backup_file}" 2>/dev/null)"
       acodec="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "${backup_file}" 2>/dev/null)"
       if [ -n "${vcodec}" ]; then
-        echo "[OK] Backup video track is readable (codec: ${vcodec})"
+        echo "${TAG_OK} Backup video track is readable (codec: ${vcodec})"
       else
-        echo "[ERROR] No video track found in the backup file"
+        echo "${TAG_ERR} No video track found in the backup file"
         has_error=1
       fi
       if [ -n "${acodec}" ]; then
-        echo "[OK] Backup audio track is readable (codec: ${acodec})"
+        echo "${TAG_OK} Backup audio track is readable (codec: ${acodec})"
       else
-        echo "[ERROR] No audio track found in the backup file"
+        echo "${TAG_ERR} No audio track found in the backup file"
         has_error=1
       fi
       echo "     (this doesn't check for a match with the live OBS stream -- that"
@@ -167,7 +183,7 @@ cmd_start() {
     echo $! > "${MEDIAMTX_PID_FILE}"
     sleep 1
     if ! pid_alive "${MEDIAMTX_PID_FILE}"; then
-      echo "[ERROR] MediaMTX failed to start, see ${MEDIAMTX_LOG}"
+      echo "${TAG_ERR} MediaMTX failed to start, see ${MEDIAMTX_LOG}"
       tail -n 20 "${MEDIAMTX_LOG}" 2>/dev/null
       return 1
     fi
@@ -187,7 +203,7 @@ cmd_start() {
     echo $! > "${CONTROLLER_PID_FILE}"
     sleep 1
     if ! pid_alive "${CONTROLLER_PID_FILE}"; then
-      echo "[ERROR] Controller failed to start, see controller/controller.stdout.log"
+      echo "${TAG_ERR} Controller failed to start, see controller/controller.stdout.log"
       tail -n 20 "${BASE_DIR}/controller/controller.stdout.log" 2>/dev/null
       return 1
     fi
@@ -249,7 +265,8 @@ cmd_logs() {
   echo "== controller/controller.log (last 50 lines) =="
   tail -n 50 "${BASE_DIR}/controller/controller.log" 2>/dev/null || echo "(log not created yet)"
   echo
-  echo "Individual ffmpeg process logs: controller/ffmpeg-{relay,backup,outbound}.log"
+  echo "Individual ffmpeg process logs: controller/ffmpeg-relay.log, ffmpeg-backup.log,"
+  echo "and one per output platform: controller/ffmpeg-out-<name>.log"
   echo "MediaMTX log: ${MEDIAMTX_LOG}"
 }
 
@@ -261,7 +278,7 @@ cmd_credentials() {
   # реального значення). Ця команда натомість щоразу читає їх напряму
   # з mediamtx.yml/config.json — працює завжди, скільки завгодно разів.
   if [ ! -f "${MEDIAMTX_YML}" ] || [ ! -f "${CONFIG}" ]; then
-    echo "[ERROR] Config files don't exist yet -- run ./install.sh first"
+    echo "${TAG_ERR} Config files don't exist yet -- run ./install.sh first"
     return 1
   fi
 
@@ -282,8 +299,8 @@ cmd_credentials() {
   echo "Dashboard -- OBS -> Docks -> Custom Browser Docks (or just open it"
   echo "in any browser -- keep the URL private):"
   echo -e "  ${bold}${cyan}http://${public_host}:${port}/dashboard?token=${dashboard_token}${reset}"
-  echo "  Settings tab: Twitch RTMP URL + Stream Key (Twitch Creator"
-  echo "  Dashboard -> Settings -> Stream -> Primary Stream Key)."
+  echo "  Settings tab: primary platform RTMP URL (+ stream key) and extra"
+  echo "  restream platforms. Control tab: toggle each platform on/off live."
   echo
   echo "  Tip: for a dock that survives the server being down (retries"
   echo "  instead of a bare error page), copy this generated wrapper to"

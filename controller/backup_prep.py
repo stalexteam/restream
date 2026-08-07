@@ -21,12 +21,19 @@ class BackupPreparer:
         self._prepared = backup_source.with_name(backup_source.stem + ".prepared" + backup_source.suffix)
         self._prepared_meta = backup_source.with_name(backup_source.stem + ".prepared.meta.json")
         self._lock = threading.Lock()
+        # Останні визначені параметри живого потоку (width/height/fps/
+        # кодеки) -- дашборд показує їх у тултипі OBS-індикатора. None,
+        # поки не було жодного успішного probe цього ефіру.
+        self._last_live_params: dict | None = None
 
     def current_source(self) -> Path:
         """Готова (перекодована) копія заглушки, якщо є, інакше оригінал."""
         if self._prepared.exists():
             return self._prepared
         return self._backup_source
+
+    def last_live_params(self) -> dict | None:
+        return self._last_live_params
 
     def prepare_async(self, live_probe_url: str) -> None:
         """
@@ -48,6 +55,7 @@ class BackupPreparer:
                 "check/preparation for this stream start"
             )
             return
+        self._last_live_params = live_params
         self._ensure_matches_live(live_params)
 
     def _ensure_matches_live(self, live_params: dict) -> None:
