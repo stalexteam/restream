@@ -4,45 +4,38 @@
 flowchart TB
   subgraph PC["Your PC — OBS"]
     direction LR
-    M["Main output<br/>video + full audio"]
-    X["Extra output<br/>obs-multi-rtmp<br/>(optional)"]
+    M["Main output"]
+    X["Extra output"]
   end
-
-  NET["Your flaky ISP / uplink<br/>(can drop any time)"]
-
+  NET["Your flaky ISP"]
   subgraph VPS["VPS — restream-controller"]
     direction TB
-    I["MediaMTX<br/>RTMP ingest"]
+    I["MediaMTX ingest"]
     BK["Backup video"]
-    subgraph PIPES["pipelines — independent, -c copy"]
+    subgraph PIPES["pipelines (-c copy)"]
       direction LR
-      P1["restream 'main'<br/>full mix"]
-      P2["input 'clean'<br/>music-free audio"]
-      P3["remux<br/>main video + clean audio"]
+      P1["restream (main)"]
+      P2["input (clean)"]
+      P3["remux"]
       P1 -. video .-> P3
       P2 -. audio .-> P3
     end
     I --> PIPES
     BK -. on drop .-> PIPES
   end
-
   subgraph PLAT["Platforms"]
     direction LR
     T["Twitch"]
     K["Kick"]
     Y["YouTube"]
   end
-
-  M -- RTMP --> NET
-  X -- RTMP --> NET
-  NET -- RTMP --> I
-
-  P1 -- RTMP --> T
-  P1 -- RTMP --> K
-  P3 -- RTMP --> Y
+  M --> NET
+  X --> NET
+  NET --> I
+  P1 --> T
+  P1 --> K
+  P3 --> Y
 ```
-
-OBS publishes **1+ RTMP streams** to the VPS; the controller relays each to its platforms with `-c copy` (no re-encoding) and switches to a **backup video** if your connection drops. Usually it's one stream in, fanned out to several platforms; with [multiple pipelines](Doc/Setup/Setup.md#multiple-pipelines-different-feeds-to-different-platforms) / [remux](Doc/Remux/Remux.md) it can be several in and several out (e.g. a music-free feed just for YouTube). *(Diagram renders on GitHub.)*
 
 Continuous OBS -> multi-platform restreaming: publish once from OBS and relay to one **primary** platform plus any number of extra **restream** platforms (Twitch, YouTube, Kick, …). If your internet connection drops, the stream doesn't end — it switches to a backup video until the connection comes back (or until a timeout is reached).
 
