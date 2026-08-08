@@ -1,3 +1,5 @@
+![Dashboard](Doc/Panel.png)
+
 ## restream-controller
 
 Continuous OBS -> multi-platform restreaming: publish once from OBS and relay to one **primary** platform plus any number of extra **restream** platforms (Twitch, YouTube, Kick, …). If your internet connection drops, the stream doesn't end — it switches to a backup video until the connection comes back (or until a timeout is reached).
