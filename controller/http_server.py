@@ -30,8 +30,8 @@ _STATIC_CONTENT_TYPES = {
 _MAX_REQUEST_BODY = 65536
 
 
-def make_handler(controller, config: dict, hub, config_path: Path):
-    dashboard_dir = controller.base_dir / "controller" / "dashboard"
+def make_handler(manager, config: dict, hub, config_path: Path):
+    dashboard_dir = manager.base_dir / "controller" / "dashboard"
 
     class Handler(BaseHTTPRequestHandler):
         # Обмежує читання самого запиту (рядок запиту + заголовки, і наше
@@ -89,13 +89,18 @@ def make_handler(controller, config: dict, hub, config_path: Path):
             if length:
                 self.rfile.read(length)
 
-            path = urlsplit(self.path).path
+            parsed = urlsplit(self.path)
+            path = parsed.path
+            # MediaMTX прокидує $MTX_PATH у хук -> знаємо, ЯКИЙ ingest-шлях
+            # (= пайплайн) підняв/впав. Відсутній ?path (одношляхова
+            # конфігурація/back-compat) -> менеджер роутить у дефолтний.
+            mtx_path = parse_qs(parsed.query).get("path", [None])[0]
 
             if path == "/hooks/available":
                 if not self._is_localhost():
                     self._send(403, {"error": "forbidden"})
                     return
-                controller.on_available()
+                manager.on_available(mtx_path)
                 self._send(200, {"ok": True})
                 return
 
@@ -103,7 +108,7 @@ def make_handler(controller, config: dict, hub, config_path: Path):
                 if not self._is_localhost():
                     self._send(403, {"error": "forbidden"})
                     return
-                controller.on_unavailable()
+                manager.on_unavailable(mtx_path)
                 self._send(200, {"ok": True})
                 return
 
@@ -118,7 +123,7 @@ def make_handler(controller, config: dict, hub, config_path: Path):
                 if not self._is_localhost():
                     self._send(403, {"error": "forbidden"})
                     return
-                self._send(200, controller.status())
+                self._send(200, manager.status())
                 return
 
             if path == "/dashboard":
@@ -212,22 +217,22 @@ def make_handler(controller, config: dict, hub, config_path: Path):
             if command == "register_source":
                 # obs-source.html представляється при коннекті (з id своєї
                 # сесії OBS) -> hub рахує це з'єднання для індикатора Source,
-                # контролер оновлює "останню відому сесію". Якщо саме ця
+                # менеджер оновлює "останню відому сесію". Якщо саме ця
                 # сесія заглушена (HALT) -- точково кажемо цьому джерелу
                 # зупинити OBS (кейс: source повернувся ПІСЛЯ обриву).
                 obs_id = message.get("obs_id")
                 hub.mark_source(self)
-                controller.report_obs_session(obs_id)
-                if controller.is_session_halted(obs_id):
+                manager.report_obs_session(obs_id)
+                if manager.is_session_halted(obs_id):
                     ws.send_text(self, json.dumps({"type": "control", "action": "stop_streaming"}), write_lock)
             elif command == "stop_broadcast":
-                controller.on_manual_stop()
+                manager.on_manual_stop()
             elif command == "halt":
-                controller.on_dashboard_halt()
+                manager.on_dashboard_halt()
             elif command == "obs_streaming_started":
                 # Реальний старт стриму OBS -> нова сесія з новим id.
-                controller.report_obs_session(message.get("obs_id"))
-                controller.on_obs_streaming_started()
+                manager.report_obs_session(message.get("obs_id"))
+                manager.on_obs_streaming_started()
             elif command == "get_settings":
                 self._handle_get_settings(write_lock)
             elif command == "save_settings":
@@ -235,67 +240,130 @@ def make_handler(controller, config: dict, hub, config_path: Path):
             elif command == "enable_output":
                 name = message.get("name")
                 if isinstance(name, str):
-                    controller.enable_destination(name)
+                    manager.enable_output(name, self._pipeline_of(message))
             elif command == "disable_output":
                 name = message.get("name")
                 if isinstance(name, str):
-                    controller.disable_destination(name)
+                    manager.disable_output(name, self._pipeline_of(message))
             elif command == "add_output":
                 self._handle_add_output(message, write_lock)
             elif command == "update_output":
                 self._handle_update_output(message, write_lock)
             elif command == "remove_output":
                 self._handle_remove_output(message, write_lock)
+            elif command == "enable_pipeline":
+                name = message.get("name")
+                if isinstance(name, str):
+                    manager.enable_pipeline(name)
+                    self._handle_get_settings(write_lock)
+            elif command == "disable_pipeline":
+                name = message.get("name")
+                if isinstance(name, str):
+                    manager.disable_pipeline(name)
+                    self._handle_get_settings(write_lock)
+            elif command == "add_pipeline":
+                self._handle_add_pipeline(message, write_lock)
+            elif command == "update_pipeline":
+                self._handle_update_pipeline(message, write_lock)
+            elif command == "remove_pipeline":
+                self._handle_remove_pipeline(message, write_lock)
             else:
                 logging.warning("dashboard: unknown /ws command: %r", command)
 
-        def _output_names(self):
-            return [p["name"] for p in controller.outputs_for_settings()]
+        @staticmethod
+        def _pipeline_of(message: dict):
+            # Ім'я пайплайна з payload команди; відсутнє (одношляховий
+            # дашборд/back-compat) -> None -> дефолтний пайплайн.
+            value = message.get("pipeline")
+            return value if isinstance(value, str) and value else None
+
+        def _output_names(self, pipeline):
+            return manager.output_names(pipeline)
 
         def _reply_output(self, ok: bool, errors: dict, write_lock):
             ws.send_text(self, json.dumps({"type": "output_result", "ok": ok, "errors": errors}), write_lock)
 
+        def _reply_pipeline(self, ok: bool, errors: dict, write_lock):
+            ws.send_text(self, json.dumps({"type": "pipeline_result", "ok": ok, "errors": errors}), write_lock)
+
         def _handle_get_settings(self, write_lock):
-            # System-поля + список площадок (server/key для модалки Modify,
-            # зібраний url для маскованого показу в списку).
+            # Глобальні System-поля (offline/connect/read/icmp) + вкладена
+            # структура пайплайнів (кожен зі своїм backup, авто-призначеним
+            # ingest-шляхом + готовим OBS-ключем, і списком площадок).
             data = settings_store.load_editable(config_path)
-            data["platforms"] = controller.outputs_for_settings()
+            data["pipelines"] = manager.pipelines_for_settings()
             ws.send_text(self, json.dumps({"type": "settings", "data": data}), write_lock)
 
+        def _handle_add_pipeline(self, message: dict, write_lock):
+            name = (message.get("name") or "").strip()
+            backup = (message.get("backup_file") or "").strip()
+            errors = settings_store.validate_pipeline(name, backup, manager.pipeline_names(), manager.base_dir)
+            if errors:
+                self._reply_pipeline(False, errors, write_lock)
+                return
+            manager.add_pipeline(name, backup)  # ingest-шлях призначається автоматично
+            self._reply_pipeline(True, {}, write_lock)
+            self._handle_get_settings(write_lock)
+
+        def _handle_update_pipeline(self, message: dict, write_lock):
+            old = message.get("name")
+            new_name = (message.get("new_name") or "").strip()
+            backup = (message.get("backup_file") or "").strip()
+            if not isinstance(old, str) or old not in manager.pipeline_names():
+                self._reply_pipeline(False, {"_": "unknown pipeline"}, write_lock)
+                return
+            names = [n for n in manager.pipeline_names() if n != old]  # rename на будь-яке вільне
+            errors = settings_store.validate_pipeline(new_name, backup, names, manager.base_dir)
+            if errors:
+                self._reply_pipeline(False, errors, write_lock)
+                return
+            manager.update_pipeline(old, new_name, backup)
+            self._reply_pipeline(True, {}, write_lock)
+            self._handle_get_settings(write_lock)
+
+        def _handle_remove_pipeline(self, message: dict, write_lock):
+            name = message.get("name")
+            if isinstance(name, str):
+                manager.remove_pipeline(name)
+            self._handle_get_settings(write_lock)
+
         def _handle_add_output(self, message: dict, write_lock):
+            pipeline = self._pipeline_of(message)
             name = (message.get("name") or "").strip()
             server = (message.get("server") or "").strip()
             key = (message.get("key") or "").strip()
-            errors = settings_store.validate_output(name, server, key, self._output_names())
+            errors = settings_store.validate_output(name, server, key, self._output_names(pipeline))
             if errors:
                 self._reply_output(False, errors, write_lock)
                 return
-            controller.add_destination(name, server, key)
+            manager.add_output(name, server, key, pipeline)
             self._reply_output(True, {}, write_lock)
             self._handle_get_settings(write_lock)
 
         def _handle_update_output(self, message: dict, write_lock):
+            pipeline = self._pipeline_of(message)
             old = message.get("name")
             new_name = (message.get("new_name") or "").strip()
             server = (message.get("server") or "").strip()
             key = (message.get("key") or "").strip()
-            if not isinstance(old, str) or old not in self._output_names():
+            names = self._output_names(pipeline)
+            if not isinstance(old, str) or old not in names:
                 self._reply_output(False, {"_": "unknown platform"}, write_lock)
                 return
             # rename дозволено на будь-яке вільне ім'я -> виключаємо власне старе
-            existing = [n for n in self._output_names() if n != old]
+            existing = [n for n in names if n != old]
             errors = settings_store.validate_output(new_name, server, key, existing)
             if errors:
                 self._reply_output(False, errors, write_lock)
                 return
-            controller.update_destination(old, new_name, server, key)
+            manager.update_output(old, new_name, server, key, pipeline)
             self._reply_output(True, {}, write_lock)
             self._handle_get_settings(write_lock)
 
         def _handle_remove_output(self, message: dict, write_lock):
             name = message.get("name")
             if isinstance(name, str):
-                controller.remove_destination(name)
+                manager.remove_output(name, self._pipeline_of(message))
             self._handle_get_settings(write_lock)
 
         def _handle_save_settings(self, message: dict, write_lock):
@@ -307,7 +375,7 @@ def make_handler(controller, config: dict, hub, config_path: Path):
                 }), write_lock)
                 return
 
-            errors = settings_store.validate_system(values, controller.base_dir)
+            errors = settings_store.validate_system(values, manager.base_dir)
             if errors:
                 ws.send_text(self, json.dumps({
                     "type": "settings_saved", "ok": False, "errors": errors,
@@ -319,28 +387,26 @@ def make_handler(controller, config: dict, hub, config_path: Path):
             # apply_settings (яке оновлює in-memory config). backup_file/
             # offline_timeout apply_settings застосовує точково, живцем.
             # (Площадки тут не при чому -- окремі negайні команди.)
-            old_connect = controller.config.get("connect_timeout_ms")
-            old_read = controller.config.get("read_timeout_ms")
+            old_connect = manager.config.get("connect_timeout_ms")
+            old_read = manager.config.get("read_timeout_ms")
 
-            controller.apply_settings(values)
+            manager.apply_settings(values)
             logging.info("dashboard: system settings saved and applied (timeouts/backup)")
             ws.send_text(self, json.dumps({"type": "settings_saved", "ok": True}), write_lock)
 
             new_connect = int(values["connect_timeout_ms"])
             new_read = int(values["read_timeout_ms"])
             if new_connect != old_connect or new_read != old_read:
-                current_state = controller.status()["state"]
-                if current_state != "OFFLINE":
+                broadcasting = any(p["state"] != "OFFLINE" for p in manager.status()["pipelines"])
+                if broadcasting:
                     logging.warning(
-                        "dashboard: applying connect/read timeout while state=%s -- "
+                        "dashboard: applying connect/read timeout while broadcasting -- "
                         "restarting MediaMTX ends the current broadcast",
-                        current_state,
                     )
                 try:
-                    mediamtx_control.sync_read_timeout(
-                        controller.base_dir / "mediamtx.yml", new_connect, new_read,
-                    )
-                    mediamtx_control.restart_mediamtx(controller.base_dir)
+                    # mediamtx.yml рендериться заново з оновленого config
+                    # (apply_settings уже поклав нові таймаути в manager.config).
+                    mediamtx_control.restart_mediamtx(manager.base_dir, manager.config)
                 except Exception:
                     # Не вдалось перезапустити MediaMTX -- краще живий,
                     # досяжний контролер (з чіткою помилкою в логах про

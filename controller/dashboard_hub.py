@@ -22,8 +22,8 @@ TICK_SEC = 1.0
 
 
 class DashboardHub:
-    def __init__(self, controller, base_dir: Path):
-        self._controller = controller
+    def __init__(self, manager, base_dir: Path):
+        self._manager = manager
         self._base_dir = base_dir
         self._lock = threading.Lock()
         self._connections: dict[object, threading.Lock] = {}
@@ -67,9 +67,10 @@ class DashboardHub:
     def register(self, handler) -> threading.Lock:
         """
         Знімок будуємо ПОЗА self._lock -- _build_snapshot() викликає
-        controller.status(), який бере Controller.lock, а Controller
-        (_emit_event/on_control) сам викликає hub у зворотному порядку
-        (тримаючи Controller.lock, бере self._lock). Тримати обидва
+        manager.status() (який бере Manager.lock + по черзі локи
+        пайплайнів), а Manager (_emit_event/on_control) сам викликає hub
+        у зворотному порядку (тримаючи свій лок, бере self._lock).
+        Тримати обидва
         локи одночасно в протилежних порядках із двох різних потоків
         -- deadlock, тож _build_snapshot() винесено назовні. Ціна:
         реєстрація вже не строго атомарна відносно паралельного
@@ -146,26 +147,29 @@ class DashboardHub:
         return {key: value for key, value in current.items() if previous.get(key) != value}
 
     def _build_snapshot(self) -> dict:
-        status = self._controller.status()
+        status = self._manager.status()
         components = {
             "mediamtx": self._component(self._mediamtx_pid()),
             "controller": self._component(os.getpid()),
-            "relay": self._component(status.pop("relay_pid")),
-            "backup": self._component(status.pop("backup_pid")),
         }
+        # relay/backup та виходи тепер per-pipeline: кожен пайплайн несе
+        # власні relay_pid/backup_pid і список destinations. Збагачуємо
+        # їх CPU/RSS так само, як глобальні компоненти; relay/backup
+        # кладемо в загальну мапу компонентів під ключем "<роль>:<пайплайн>".
+        for pipeline in status.get("pipelines", []):
+            name = pipeline.get("name", "?")
+            components[f"relay:{name}"] = self._component(pipeline.pop("relay_pid", None))
+            components[f"backup:{name}"] = self._component(pipeline.pop("backup_pid", None))
+            for dest in pipeline.get("destinations", []):
+                pid = dest.get("pid")
+                running = pid is not None and self._pid_alive(pid)
+                stats = proc_stats.sample(pid) if running else None
+                dest["cpu_percent"] = stats["cpu_percent"] if stats else None
+                dest["rss_mb"] = stats["rss_mb"] if stats else None
         status["components"] = components
         # Чи підключений зараз хоч один obs-source.html (індикатор Source).
         # Читання set поза self._lock -- best-effort, атомарне під GIL.
         status["obs_source_connected"] = bool(self._source_handlers)
-        # Кожен вихід -- окремий ffmpeg-процес; збагачуємо його рядок
-        # CPU/RSS так само, як компоненти (список destinations уже несе
-        # name/enabled/статус/дропи/ping зі state_machine.status()).
-        for dest in status.get("destinations", []):
-            pid = dest.get("pid")
-            running = pid is not None and self._pid_alive(pid)
-            stats = proc_stats.sample(pid) if running else None
-            dest["cpu_percent"] = stats["cpu_percent"] if stats else None
-            dest["rss_mb"] = stats["rss_mb"] if stats else None
         return status
 
     @staticmethod
@@ -189,6 +193,6 @@ class DashboardHub:
 
     def _mediamtx_pid(self) -> int | None:
         try:
-            return int((self._base_dir / ".mediamtx.pid").read_text(encoding="ascii").strip())
+            return int((self._base_dir / "data" / ".mediamtx.pid").read_text(encoding="ascii").strip())
         except (OSError, ValueError):
             return None

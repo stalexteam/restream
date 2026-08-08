@@ -159,8 +159,8 @@ h2 {
   margin-top: 8px;
 }
 
-#obs-table th {
-  width: 64px;
+.obs-table th {
+  width: 80px;
   text-transform: none;
   font-size: 13px;
 }
@@ -251,17 +251,6 @@ body.ws-disconnected #tab-settings {
   width: auto;
   flex: 0 0 auto;
   margin: 0;
-}
-
-.masked-field {
-  display: flex;
-  gap: 6px;
-}
-
-.masked-field input {
-  flex: 1;
-  min-width: 0;
-  font-family: ui-monospace, monospace;
 }
 
 .reveal-toggle {
@@ -377,20 +366,20 @@ body.ws-disconnected #tab-settings {
 /* Фіксована розкладка -- колонки не "стрибають", коли значення
    (uptime/ping/health/статус) міняють довжину щосекунди. Ширини задані
    класами на th; Platform без ширини -> забирає решту. */
-#control-table {
+.control-table {
   table-layout: fixed;
 }
 
-#control-table th,
-#control-table td {
+.control-table th,
+.control-table td {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: center;  /* усе по центру, крім першої колонки (Platform) */
 }
 
-#control-table th:first-child,
-#control-table td:first-child {
+.control-table th:first-child,
+.control-table td:first-child {
   text-align: left;
 }
 
@@ -465,11 +454,27 @@ body.ws-disconnected #tab-settings {
 }
 
 .platform-name {
-  flex: 0 0 22%;
+  flex: 1 1 auto;
+  min-width: 0;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Role marker (★) replacing the "(primary)"/"(default)" suffixes; the title
+   attribute carries the hint ("Primary" / "Default") on hover. */
+.role-star {
+  color: var(--orange);
+  cursor: help;
+}
+
+/* Buttons pinned to the right of the platform row (Modify is last). */
+.platform-actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
 }
 
 .platform-url {
@@ -517,7 +522,8 @@ body.ws-disconnected #tab-settings {
   border-color: var(--muted);
 }
 
-.pf-delete:hover {
+.pf-delete:hover,
+.pl-delete:hover {
   color: var(--red);
   border-color: var(--red);
 }
@@ -586,18 +592,47 @@ body.ws-disconnected #tab-settings {
   gap: 10px;
 }
 
+/* Title + action bars: recessed strips spanning the modal's padding
+   (negative margins), a header on top and a footer at the bottom, each
+   with a divider -- same title-bar look as .pipeline-head. */
+.modal h2 {
+  margin: -16px -16px 0;
+  padding: 11px 16px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  border-radius: 8px 8px 0 0;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--fg);
+}
+
+.modal .actions {
+  margin: 0 -16px -16px;
+  padding: 12px 16px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 8px 8px;
+}
+
 .preview {
   background: var(--bg);
-  border: 1px solid var(--border);
+  /* Dashed border (vs the solid border on editable inputs) marks this as a
+     read-only, display-only field. Text stays at full contrast so the
+     url/key remains legible and copyable. */
+  border: 1px dashed var(--gray);
   border-radius: 4px;
   padding: 7px 9px;
   font-family: ui-monospace, monospace;
   font-size: 12px;
   color: var(--fg);
-  /* Один рядок + горизонтальний скрол + виділення одним кліком, як у
-     розкритого url у списку -- висота не стрибає, копіюється повністю. */
+  /* Один рядок + горизонтальний скрол + виділення одним кліком, копіюється
+     повністю. overflow-x:scroll (не auto) РЕЗЕРВУЄ місце під смугу завжди,
+     тож поле не росте у висоту, коли довгий url з'являється/ховається; трек
+     смуги прозорий -> коли текст влазить, візуально нічого не видно. */
   white-space: nowrap;
-  overflow-x: auto;
+  overflow-x: scroll;
   overflow-y: hidden;
   user-select: all;
   -webkit-user-select: all;
@@ -628,4 +663,146 @@ body.ws-disconnected #tab-settings {
 .field-row {
   display: flex;
   justify-content: flex-end;
+}
+
+/* --- per-pipeline blocks (Status / Control / Settings) --- */
+
+/* Each pipeline's head reads as a title bar: it spans the panel's padding
+   (negative margins) with a recessed background + bottom divider. */
+.pipeline-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: -14px -16px 12px;
+  padding: 9px 16px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  border-radius: 4px 4px 0 0;
+}
+
+/* h2 inside a pipeline head shouldn't keep the default bottom margin. */
+.pipeline-head h2 {
+  margin: 0;
+}
+
+.pipeline-title {
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--fg);
+}
+
+.pipeline-toggle-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.pipeline-toggle {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.pipeline-head-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* The badge in a pipeline head reuses .pill sizing + .bstate-* colours. */
+.pl-badge {
+  min-width: 74px;
+}
+
+.field-two {
+  display: flex;
+  gap: 10px;
+}
+
+.field-two .field {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Section header bar: same recessed title-bar look as a pipeline head.
+   .panel-head carries an action button (Pipelines + Add pipeline); a plain
+   first-child <h2> (Components, System settings) becomes a bar too. */
+.panel-head,
+.panel > h2:first-child {
+  margin: -14px -16px 12px;
+  padding: 9px 16px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  border-radius: 4px 4px 0 0;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.panel-head h2 {
+  margin: 0;
+}
+
+.panel-head .ghost-button {
+  margin-top: 0;
+  align-self: auto;
+}
+
+/* Masked-secret grid, shared by both modify modals: a Server row and a
+   Stream Key row (label + value on one line each), with a single tall
+   Show/Hide button spanning both on the right. The pipeline modal fills the
+   value cells with read-only previews; the platform modal with inputs plus a
+   full-width Final URL row underneath. */
+.masked-grid {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 6px 8px;
+  align-items: center;
+}
+
+.masked-grid-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.masked-grid input {
+  width: 100%;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  font-family: ui-monospace, monospace;
+  padding: 7px 9px;
+}
+
+.masked-grid input:focus {
+  outline: 2px solid var(--blue);
+  outline-offset: -1px;
+}
+
+.masked-grid-toggle {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  align-self: stretch;
+  /* Fixed width so the Show/Hide text swap doesn't reflow the grid. */
+  min-width: 60px;
+  text-align: center;
+}
+
+/* Final URL row under the two sensitive rows -- spans the value + button
+   columns (the tall Show button covers only the Server/Key rows above). */
+.masked-grid-full {
+  grid-column: 2 / span 2;
 }

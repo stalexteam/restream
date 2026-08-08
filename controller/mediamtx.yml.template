@@ -1,0 +1,75 @@
+# MediaMTX configuration for the restream-controller project.
+# This is a TEMPLATE. data/mediamtx.yml is a GENERATED artifact, rendered
+# from this file + data/config.json before every MediaMTX start (by
+# controller/mediamtx_config.py, called from restreamctl.sh and the
+# controller's mediamtx_control.py). config.json is the single source of
+# truth for the two RTMP passwords and the timeouts; they are substituted
+# here. Hand edits to data/mediamtx.yml don't last -- to customise
+# MediaMTX, edit THIS template instead. The password tokens are
+# intentionally not spelled out in this comment, so the substitution can't
+# corrupt the header.
+
+logLevel: info
+logDestinations: [stdout]
+
+# How long to wait for data from OBS before considering the connection
+# dead and closing it (even if the TCP socket itself is still open --
+# a "silent" drop). This closing is what triggers runOnUnavailable below
+# -> the backup video, as a slow backstop.
+#
+# DERIVED value: connect_timeout_ms + read_timeout_ms from
+# controller/config.json, recalculated and overwritten right before every
+# MediaMTX start (restreamctl.sh, or the controller's mediamtx_control.py).
+# It is GLOBAL: MediaMTX has one readTimeout per instance, shared by all
+# ingest paths. Editing it here by hand has no lasting effect.
+readTimeout: 5500ms
+
+# We don't need MediaMTX's control API -- the controller manages the
+# ffmpeg processes directly, so it's disabled to avoid attack surface.
+api: false
+
+# RTMP is the only protocol we need (OBS publishes over RTMP).
+rtmp: true
+rtmpAddress: :1935
+# Other protocols are disabled -- not used by this project. (MoQ was
+# added in a newer MediaMTX and is on by default, opening :8892.)
+rtsp: no
+hls: no
+webrtc: no
+srt: no
+moq: no
+
+# --- Authentication ---
+# Anonymous publishing is disabled; only two explicit users remain. Both
+# use a REGEX path (~^live/...): OBS may publish to any single-segment
+# path under live/ (one per pipeline -- the controller assigns the names
+# dynamically), and the internal user may read them (localhost only).
+# A publish to anything NOT matching this regex is rejected.
+authMethod: internal
+authInternalUsers:
+  - user: obs
+    pass: __OBS_PASS__
+    ips: []
+    permissions:
+      - action: publish
+        path: ~^live/[A-Za-z0-9_-]+$
+  - user: internal
+    pass: __INTERNAL_PASS__
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: read
+        path: ~^live/[A-Za-z0-9_-]+$
+
+# --- Paths ---
+# A single REGEX path matches every pipeline's ingest path (live/main,
+# live/<pipeline>, ...). MediaMTX calls these hooks when a publisher (OBS)
+# appears or disappears; $MTX_PATH tells the controller WHICH path (=
+# pipeline) it was, so it can route to the right pipeline. Adding/removing
+# a pipeline needs no change here and no MediaMTX restart -- the path is
+# accepted the moment OBS publishes to it. The hooks themselves decide
+# nothing; all the logic lives in the controller.
+paths:
+  ~^live/[A-Za-z0-9_-]+$:
+    runOnAvailable: curl -s -X POST "http://127.0.0.1:8790/hooks/available?path=$MTX_PATH"
+    runOnAvailableRestart: false
+    runOnUnavailable: curl -s -X POST "http://127.0.0.1:8790/hooks/unavailable?path=$MTX_PATH"

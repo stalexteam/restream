@@ -8,12 +8,17 @@
 set -uo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG="${BASE_DIR}/controller/config.json"
-MEDIAMTX_YML="${BASE_DIR}/mediamtx.yml"
+DATA_DIR="${BASE_DIR}/data"
+LOGS_DIR="${BASE_DIR}/logs"
+CONFIG="${DATA_DIR}/config.json"
+# data/mediamtx.yml -- generated artifact, rendered from the template +
+# config.json before every MediaMTX start (render_mediamtx_yml below).
+MEDIAMTX_TEMPLATE="${BASE_DIR}/controller/mediamtx.yml.template"
+MEDIAMTX_YML="${DATA_DIR}/mediamtx.yml"
 MEDIAMTX_BIN="${BASE_DIR}/bin/mediamtx"
-MEDIAMTX_PID_FILE="${BASE_DIR}/.mediamtx.pid"
-CONTROLLER_PID_FILE="${BASE_DIR}/.controller.pid"
-MEDIAMTX_LOG="${BASE_DIR}/mediamtx.log"
+MEDIAMTX_PID_FILE="${DATA_DIR}/.mediamtx.pid"
+CONTROLLER_PID_FILE="${DATA_DIR}/.controller.pid"
+MEDIAMTX_LOG="${LOGS_DIR}/mediamtx.log"
 
 # Кольорові статус-мітки -- лише коли stdout це термінал, інакше порожні
 # (щоб `check`/`status` у файл/пайп лишались без ESC-сміття).
@@ -26,10 +31,28 @@ TAG_OK="${_c_green}[OK]${_c_reset}"
 TAG_WARN="${_c_yellow}[WARNING]${_c_reset}"
 TAG_ERR="${_c_red}[ERROR]${_c_reset}"
 
-# Читає одне поле з controller/config.json (через python3 — уникаємо
+# Читає одне поле з data/config.json (через python3 — уникаємо
 # залежності від jq).
 cfg() {
   python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ''))" "${CONFIG}" "$1" 2>/dev/null
+}
+
+# Читає одне поле з ДЕФОЛТНОГО пайплайна (pipelines[] з is_default, інакше
+# перший). Fallback на старе плоске top-level поле -- для інсталяцій до
+# розрізу на пайплайни (back-compat).
+pcfg() {
+  python3 -c "
+import json,sys
+c=json.load(open(sys.argv[1]))
+key=sys.argv[2]
+pls=c.get('pipelines')
+if isinstance(pls,list) and pls:
+    d=next((p for p in pls if p.get('is_default')), pls[0])
+    v=d.get(key)
+    if v not in (None,''):
+        print(v); raise SystemExit
+print(c.get(key,'') or '')
+" "${CONFIG}" "$1" 2>/dev/null
 }
 
 pid_alive() {
@@ -37,41 +60,14 @@ pid_alive() {
   [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null
 }
 
-# Ті самі мінімуми, що й у controller/settings_store.py (MIN_CONNECT_
-# TIMEOUT_MS/MIN_READ_TIMEOUT_MS) -- продубльовані тут константами
-# bash-скрипта, без спільного джерела правди між bash і Python.
-MIN_CONNECT_TIMEOUT_MS=2500
-MIN_READ_TIMEOUT_MS=300
-
-# readTimeout у mediamtx.yml = connect_timeout_ms + read_timeout_ms з
-# controller/config.json -- перераховується й підміняється в файлі
-# перед КОЖНИМ стартом MediaMTX (тут -- ручний шлях через
-# restreamctl.sh; шлях через дашборд робить те саме сам, у Python,
-# controller/mediamtx_control.py). КЛАМП, не відмова: значення могли
-# потрапити в config.json ручним редагуванням, минаючи валідацію
-# Settings-вкладки дашборда -- одна занижена цифра в конфізі не
-# повинна блокувати старт усього сервісу.
-sync_mediamtx_read_timeout() {
-  local connect_ms read_ms total_ms
-  connect_ms="$(cfg connect_timeout_ms)"
-  read_ms="$(cfg read_timeout_ms)"
-
-  if [ -z "${connect_ms}" ] || ! [ "${connect_ms}" -ge "${MIN_CONNECT_TIMEOUT_MS}" ] 2>/dev/null; then
-    if [ -n "${connect_ms}" ]; then
-      echo "${TAG_WARN} connect_timeout_ms (${connect_ms}) is below the minimum (${MIN_CONNECT_TIMEOUT_MS}ms) -- using ${MIN_CONNECT_TIMEOUT_MS}ms"
-    fi
-    connect_ms="${MIN_CONNECT_TIMEOUT_MS}"
-  fi
-
-  if [ -z "${read_ms}" ] || ! [ "${read_ms}" -ge "${MIN_READ_TIMEOUT_MS}" ] 2>/dev/null; then
-    if [ -n "${read_ms}" ]; then
-      echo "${TAG_WARN} read_timeout_ms (${read_ms}) is below the minimum (${MIN_READ_TIMEOUT_MS}ms) -- using ${MIN_READ_TIMEOUT_MS}ms"
-    fi
-    read_ms="${MIN_READ_TIMEOUT_MS}"
-  fi
-
-  total_ms=$((connect_ms + read_ms))
-  sed -i -E "s/^readTimeout:.*/readTimeout: ${total_ms}ms/" "${MEDIAMTX_YML}"
+# Рендер data/mediamtx.yml з шаблону + config.json перед КОЖНИМ стартом
+# MediaMTX (варіант Б: config.json -- єдине джерело правди для паролів і
+# таймаутів). Уся логіка (підстановка obs/internal паролів, readTimeout =
+# connect+read з клампом до мінімумів) -- у controller/mediamtx_config.py,
+# щоб bash і Python не дублювали правил. Шлях через дашборд рендерить те
+# саме сам (controller/mediamtx_control.py).
+render_mediamtx_yml() {
+  python3 "${BASE_DIR}/controller/mediamtx_config.py" "${CONFIG}" "${MEDIAMTX_TEMPLATE}" "${MEDIAMTX_YML}"
 }
 
 # --- check ---------------------------------------------------------------
@@ -82,16 +78,17 @@ cmd_check() {
   echo "== Configuration check =="
 
   if [ ! -f "${CONFIG}" ]; then
-    echo "${TAG_ERR} controller/config.json not found -- run ./install.sh first"
+    echo "${TAG_ERR} data/config.json not found -- run ./install.sh first"
     return 1
   fi
-  echo "${TAG_OK} controller/config.json found"
+  echo "${TAG_OK} data/config.json found"
 
-  if [ ! -f "${MEDIAMTX_YML}" ]; then
-    echo "${TAG_ERR} mediamtx.yml not found -- run ./install.sh first"
+  # mediamtx.yml is generated at start from this template -- check the template.
+  if [ ! -f "${MEDIAMTX_TEMPLATE}" ]; then
+    echo "${TAG_ERR} controller/mediamtx.yml.template not found -- reinstall/re-clone the repo"
     has_error=1
   else
-    echo "${TAG_OK} mediamtx.yml found"
+    echo "${TAG_OK} controller/mediamtx.yml.template found"
   fi
 
   if [ ! -x "${MEDIAMTX_BIN}" ]; then
@@ -102,13 +99,13 @@ cmd_check() {
   fi
 
   local primary_server primary_key backup_file
-  # primary is stored as server+key; fall back to the old single-URL
-  # fields (installs from before the split) for the "is it set?" check.
-  primary_server="$(cfg primary_server)"
-  [ -z "${primary_server}" ] && primary_server="$(cfg primary_url)"
-  [ -z "${primary_server}" ] && primary_server="$(cfg twitch_url)"
-  primary_key="$(cfg primary_key)"
-  backup_file="$(cfg backup_file)"
+  # primary/backup now live inside the default pipeline (pcfg); pcfg also
+  # falls back to the old flat top-level fields (pre-split installs).
+  primary_server="$(pcfg primary_server)"
+  [ -z "${primary_server}" ] && primary_server="$(pcfg primary_url)"
+  [ -z "${primary_server}" ] && primary_server="$(pcfg twitch_url)"
+  primary_key="$(pcfg primary_key)"
+  backup_file="$(pcfg backup_file)"
 
   if [ "${primary_key}" = "CHANGE_ME_STREAM_KEY" ] || [ -z "${primary_server}" ]; then
     echo "${TAG_WARN} primary platform isn't set yet -- set its server URL + stream key in the dashboard Settings tab"
@@ -119,7 +116,7 @@ cmd_check() {
   if [ -z "${backup_file}" ] || [ ! -f "${backup_file}" ]; then
     echo "${TAG_ERR} Backup video file not found: '${backup_file}'"
     echo "        Place a video file at this path, or change"
-    echo "        backup_file in controller/config.json."
+    echo "        backup_file in data/config.json."
     has_error=1
   else
     echo "${TAG_OK} Backup video file found: ${backup_file}"
@@ -174,12 +171,17 @@ cmd_start() {
   fi
   echo
 
+  mkdir -p "${DATA_DIR}" "${LOGS_DIR}"
+
   if pid_alive "${MEDIAMTX_PID_FILE}"; then
     echo "MediaMTX is already running (pid=$(cat "${MEDIAMTX_PID_FILE}"))"
   else
-    sync_mediamtx_read_timeout
+    render_mediamtx_yml
     echo "Starting MediaMTX..."
-    nohup "${MEDIAMTX_BIN}" "${MEDIAMTX_YML}" > "${MEDIAMTX_LOG}" 2>&1 < /dev/null &
+    # cwd=data so any relative artifacts MediaMTX may create (auto.crt/key)
+    # land in data/, not the project root. `exec nohup` keeps the subshell's
+    # pid ($!) equal to the MediaMTX process pid.
+    ( cd "${DATA_DIR}" && exec nohup "${MEDIAMTX_BIN}" "${MEDIAMTX_YML}" > "${MEDIAMTX_LOG}" 2>&1 < /dev/null ) &
     echo $! > "${MEDIAMTX_PID_FILE}"
     sleep 1
     if ! pid_alive "${MEDIAMTX_PID_FILE}"; then
@@ -194,17 +196,17 @@ cmd_start() {
     echo "Controller is already running (pid=$(cat "${CONTROLLER_PID_FILE}"))"
   else
     echo "Starting the controller..."
-    # stdout/stderr тут навмисно НЕ пишемо в controller/controller.log —
+    # stdout/stderr тут навмисно НЕ пишемо в logs/controller.log —
     # controller.py сам веде цей файл через logging.FileHandler; якщо
     # спрямувати сюди ж і stdout (який дублює ті самі повідомлення через
     # StreamHandler), кожен рядок логувався б двічі.
     nohup python3 "${BASE_DIR}/controller/controller.py" "${CONFIG}" \
-      > "${BASE_DIR}/controller/controller.stdout.log" 2>&1 < /dev/null &
+      > "${LOGS_DIR}/controller.stdout.log" 2>&1 < /dev/null &
     echo $! > "${CONTROLLER_PID_FILE}"
     sleep 1
     if ! pid_alive "${CONTROLLER_PID_FILE}"; then
-      echo "${TAG_ERR} Controller failed to start, see controller/controller.stdout.log"
-      tail -n 20 "${BASE_DIR}/controller/controller.stdout.log" 2>/dev/null
+      echo "${TAG_ERR} Controller failed to start, see logs/controller.stdout.log"
+      tail -n 20 "${LOGS_DIR}/controller.stdout.log" 2>/dev/null
       return 1
     fi
     echo "Controller started (pid=$(cat "${CONTROLLER_PID_FILE}"))"
@@ -255,18 +257,19 @@ cmd_status() {
   port="$(cfg listen_port)"
   if [ -n "${port}" ]; then
     echo
-    echo "== Broadcast state (controller/config.json: listen_port=${port}) =="
+    echo "== Broadcast state (data/config.json: listen_port=${port}) =="
     curl -s --max-time 3 "http://127.0.0.1:${port}/status" || echo "(controller is not responding)"
     echo
   fi
 }
 
 cmd_logs() {
-  echo "== controller/controller.log (last 50 lines) =="
-  tail -n 50 "${BASE_DIR}/controller/controller.log" 2>/dev/null || echo "(log not created yet)"
+  echo "== logs/controller.log (last 50 lines) =="
+  tail -n 50 "${LOGS_DIR}/controller.log" 2>/dev/null || echo "(log not created yet)"
   echo
-  echo "Individual ffmpeg process logs: controller/ffmpeg-relay.log, ffmpeg-backup.log,"
-  echo "and one per output platform: controller/ffmpeg-out-<name>.log"
+  echo "Individual ffmpeg process logs (per pipeline): logs/ffmpeg-relay-<pipeline>.log,"
+  echo "ffmpeg-backup-<pipeline>.log, and one per output platform:"
+  echo "logs/ffmpeg-out-<pipeline>-<name>.log"
   echo "MediaMTX log: ${MEDIAMTX_LOG}"
 }
 
@@ -276,14 +279,14 @@ cmd_credentials() {
   # install.sh друкує ці значення лише ОДИН раз, при першій генерації
   # (при повторному запуску показує "(вже задано в ...)" замість
   # реального значення). Ця команда натомість щоразу читає їх напряму
-  # з mediamtx.yml/config.json — працює завжди, скільки завгодно разів.
-  if [ ! -f "${MEDIAMTX_YML}" ] || [ ! -f "${CONFIG}" ]; then
-    echo "${TAG_ERR} Config files don't exist yet -- run ./install.sh first"
+  # з config.json — працює завжди, скільки завгодно разів.
+  if [ ! -f "${CONFIG}" ]; then
+    echo "${TAG_ERR} data/config.json doesn't exist yet -- run ./install.sh first"
     return 1
   fi
 
   local obs_pass dashboard_token port public_host
-  obs_pass="$(grep -A2 'user: obs' "${MEDIAMTX_YML}" | grep 'pass:' | awk '{print $2}')"
+  obs_pass="$(cfg obs_pass)"
   dashboard_token="$(cfg dashboard_token)"
   port="$(cfg listen_port)"
   public_host="$(cfg public_host)"
@@ -307,9 +310,15 @@ cmd_credentials() {
   echo "  the OBS machine and point the dock at it via a local file path:"
   echo -e "  ${bold}${cyan}${BASE_DIR}/obs-dock.html${reset}"
   echo
+  local default_path
+  default_path="$(pcfg live_path)"
+  [ -z "${default_path}" ] && default_path="live/main"
   echo "OBS -> Settings -> Stream -> Service: \"Custom...\":"
   echo -e "  Server:      ${bold}${cyan}rtmp://${public_host}:1935/live${reset}"
-  echo -e "  Stream Key:  ${bold}${cyan}main?user=obs&pass=${obs_pass}${reset}"
+  echo -e "  Stream Key:  ${bold}${cyan}${default_path#live/}?user=obs&pass=${obs_pass}${reset}"
+  echo "  (This is the default pipeline. Extra pipelines are created in the"
+  echo "  dashboard, which shows each one's ready-to-copy Stream Key -- the"
+  echo "  ingest path is assigned automatically.)"
   echo
   echo "OBS -> add a Browser Source (in a scene, size 32x32). Copy this"
   echo "generated file to the OBS machine and point the source at it via a"

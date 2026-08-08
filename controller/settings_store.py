@@ -28,41 +28,35 @@ MIN_OFFLINE_TIMEOUT_SEC = 60
 
 
 def load_editable(config_path: Path) -> dict:
-    """System-поля для вкладки Settings (площадки віддає state_machine окремо)."""
+    """
+    Глобальні System-поля для вкладки Settings. Per-pipeline поля
+    (`offline_timeout_sec`/`backup_file`) тепер живуть усередині
+    пайплайна -- їх додає http_server через `manager.default_local_
+    settings()`; площадки віддає менеджер окремо.
+    """
     with open(config_path, "r", encoding="utf-8") as f:
         full = json.load(f)
     return {
-        "offline_timeout_sec": full.get("offline_timeout_sec"),
-        "backup_file": full.get("backup_file", ""),
         "connect_timeout_ms": full.get("connect_timeout_ms"),
         "read_timeout_ms": full.get("read_timeout_ms"),
+        "offline_timeout_sec": full.get("offline_timeout_sec"),
         "icmp_ping": bool(full.get("icmp_ping", False)),
     }
 
 
 def validate_system(values: dict, base_dir: Path) -> dict[str, str]:
     """
-    `{поле: причина}` для невалідних System-полів, порожній словник --
-    усе ок. Все-або-нічого: викликач не застосовує нічого, якщо тут
-    щось повернулось. Значення нижче мінімуму ВІДХИЛЯЄМО з поясненням,
-    а не мовчки підганяємо.
+    `{поле: причина}` для невалідних ГЛОБАЛЬНИХ System-полів: connect/read
+    timeout (`readTimeout` MediaMTX один на інстанс) + `offline_timeout_
+    sec` (один OBS -> одне вікно очікування повернення). Порожній словник
+    -- усе ок. Per-pipeline `backup_file`/бітрейти валідує
+    `validate_pipeline` окремо. Все-або-нічого; значення нижче мінімуму
+    ВІДХИЛЯЄМО з поясненням.
     """
     errors: dict[str, str] = {}
-
-    _validate_number(values, errors, "offline_timeout_sec", MIN_OFFLINE_TIMEOUT_SEC, "seconds")
     _validate_number(values, errors, "connect_timeout_ms", MIN_CONNECT_TIMEOUT_MS, "ms")
     _validate_number(values, errors, "read_timeout_ms", MIN_READ_TIMEOUT_MS, "ms")
-
-    backup_file = values.get("backup_file", "")
-    if not isinstance(backup_file, str) or not backup_file:
-        errors["backup_file"] = "path is required"
-    else:
-        resolved = resolve_backup_path(backup_file, base_dir)
-        if not resolved.is_file():
-            errors["backup_file"] = f"file not found: {resolved}"
-        elif probe_stream_params(str(resolved)) is None:
-            errors["backup_file"] = "no readable video/audio track in this file (ffprobe failed)"
-
+    _validate_number(values, errors, "offline_timeout_sec", MIN_OFFLINE_TIMEOUT_SEC, "seconds")
     return errors
 
 
@@ -83,6 +77,34 @@ def validate_output(name: str, server: str, key: str, existing_names) -> dict[st
 
     if not _is_rtmp(output_url.build_push_url(server or "", key or "")):
         errors["server"] = "server must be an rtmp:// or rtmps:// URL"
+
+    return errors
+
+
+def validate_pipeline(name: str, backup_file: str, existing_names, base_dir: Path) -> dict[str, str]:
+    """
+    Валідація одного пайплайна (add/update). `existing_names` -- імена, з
+    якими не можна збігтись (для update викликач виключає власне старе).
+    Ingest-шлях НЕ валідуємо -- він призначається автоматично контролером
+    (динамічні regex-шляхи MediaMTX). `offline_timeout_sec` глобальний
+    (System-блок). All-or-nothing.
+    """
+    errors: dict[str, str] = {}
+
+    clean_name = (name or "").strip()
+    if not clean_name:
+        errors["name"] = "name is required"
+    elif clean_name in set(existing_names):
+        errors["name"] = f"a pipeline named '{clean_name}' already exists"
+
+    if not isinstance(backup_file, str) or not backup_file:
+        errors["backup_file"] = "path is required"
+    else:
+        resolved = resolve_backup_path(backup_file, base_dir)
+        if not resolved.is_file():
+            errors["backup_file"] = f"file not found: {resolved}"
+        elif probe_stream_params(str(resolved)) is None:
+            errors["backup_file"] = "no readable video/audio track in this file (ffprobe failed)"
 
     return errors
 

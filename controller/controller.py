@@ -20,7 +20,7 @@ from pathlib import Path
 from dashboard_hub import DashboardHub
 from http_server import make_handler
 from mediamtx_log_watch import watch as watch_mediamtx_log
-from state_machine import Controller
+from state_machine import Manager
 
 
 def load_config(path: Path) -> dict:
@@ -30,7 +30,7 @@ def load_config(path: Path) -> dict:
 
 def main():
     base_dir = Path(__file__).resolve().parent.parent
-    config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else base_dir / "controller" / "config.json"
+    config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else base_dir / "data" / "config.json"
 
     if not config_path.exists():
         print(f"Config file not found: {config_path}", file=sys.stderr)
@@ -40,7 +40,7 @@ def main():
 
     config = load_config(config_path)
 
-    log_dir = base_dir / "controller"
+    log_dir = base_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
@@ -52,36 +52,36 @@ def main():
         ],
     )
 
-    controller = Controller(config, base_dir, config_path)
-    # DashboardHub потребує controller (щоб будувати знімки стану),
-    # а Controller відповідно сповіщає hub про кожну зміну стану --
-    # взаємна залежність, тому hub створюється вже ПІСЛЯ controller,
+    manager = Manager(config, base_dir, config_path)
+    # DashboardHub потребує manager (щоб будувати знімки стану),
+    # а Manager відповідно сповіщає hub про кожну зміну стану --
+    # взаємна залежність, тому hub створюється вже ПІСЛЯ manager,
     # і колбек підключається постфактум простим присвоєнням атрибута.
-    hub = DashboardHub(controller, base_dir)
-    controller.on_change = hub.notify
-    controller.on_event = hub.push_event
-    controller.on_control = hub.push_control
+    hub = DashboardHub(manager, base_dir)
+    manager.on_change = hub.notify
+    manager.on_event = hub.push_event
+    manager.on_control = hub.push_control
 
     threading.Thread(
         target=watch_mediamtx_log,
-        args=(base_dir / "mediamtx.log", controller.on_mediamtx_connect_timeout),
+        args=(base_dir / "logs" / "mediamtx.log", manager.on_mediamtx_connect_timeout),
         daemon=True,
     ).start()
 
     def handle_signal(signum, _frame):
         logging.info("received termination signal (%s), stopping ffmpeg processes", signum)
-        controller.shutdown()
+        manager.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    handler_cls = make_handler(controller, config, hub, config_path)
+    handler_cls = make_handler(manager, config, hub, config_path)
     server = ThreadingHTTPServer((config["listen_host"], config["listen_port"]), handler_cls)
 
     logging.info(
-        "controller started on %s:%s (state=%s)",
-        config["listen_host"], config["listen_port"], controller.state,
+        "controller started on %s:%s",
+        config["listen_host"], config["listen_port"],
     )
     # Дашборд застосовує зміни налаштувань точково, живцем (bounce лише
     # зачепленого виходу / рестарт лише MediaMTX при зміні таймінгів) --
@@ -91,7 +91,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        controller.shutdown()
+        manager.shutdown()
 
 
 if __name__ == "__main__":

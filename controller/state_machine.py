@@ -1,22 +1,29 @@
 """
-Controller — стейт-машина безперервного рестриму OBS -> кілька платформ.
+Стейт-машина безперервного рестриму OBS -> кілька платформ, розрізана
+на два рівні:
 
-Дві сторони конвеєра:
+- **Pipeline** — ОДИН незалежний канонічний потік: власний ingest-шлях
+  MediaMTX (`live_path`), власні `relay`/`backup`/`FLVSwitcher`, власний
+  набір `Destination`-виходів і власна стейт-машина непрерывності
+  (`OFFLINE`/`LIVE`/`FALLBACK` + `offline_timeout`). Кожен пайплайн
+  тримає власний `Pipeline.lock`.
+- **Manager** — те, що завʼязано на "один OBS": session-латч (HALT),
+  оракул штатного стопу, право слати `stop_streaming` в OBS, роутинг
+  хуків MediaMTX по шляху, CRUD пайплайнів і їхніх виходів, персист,
+  ping-петля, колбеки в hub. Тримає `Manager.lock`.
 
-- **Source** (`relay`/`backup` + `FLVSwitcher`): формує ЄДИНИЙ
-  канонічний потік (живе відео від OBS або заглушка). Непрерывність
-  (backup-відео при обриві OBS, `offline_timeout`) — властивість цього
-  потоку, працює поки OBS публікує й увімкнено хоч один потребувач.
-- **Destinations** (`Destination` = `FfmpegProcess` + `OutputSink`):
-  однакові toggleable-виходи. `primary` (обов'язковий) + `restreams`
-  (динамічний список). Кожен незалежно вмикається/вимикається на лету;
-  повільна/впала площадка ніколи не чіпає інші (кожна має власну чергу
-  й потік-писар у `OutputSink`).
+Інваріант локів: **`Manager.lock` -> `Pipeline.lock`, ніколи навпаки
+одночасно.** Прямий напрям: `on_available(path)` бере `Manager.lock`
+(латч/роутинг) і делегує `pipeline.*` (бере `Pipeline.lock`). Зворотний
+напрям (`Pipeline -> Manager -> інші пайплайни`) НЕ виконується
+синхронно під локом-звонарем: рішення диспатчиться в окремий потік
+(`Manager.on_pipeline_gave_up`), де менеджер заново бере свої локи.
+Персист і доступ до реєстру пайплайнів — ЛИШЕ на рівні Manager під
+`Manager.lock`; методи Pipeline самі `_persist` не зовуть.
 
-Failsafe — агрегатний: жорсткий стоп усього ефіру (Halt + команда OBS
-зупинити стрім) лише якщо ЖОДЕН увімкнений потребувач не піднявся.
-Досить одного живого — упалі уходять у best-effort (тост + стоп цієї
-площадки, якщо ключ невалідний; ретрай, якщо був сбій після успіху).
+Failsafe-асиметрія: жорсткий стоп OBS (`stop_streaming`) — прерогатива
+ТІЛЬКИ дефолтного пайплайна АБО ситуації "усі пайплайни мертві".
+Додатковий пайплайн, що втратив усі свої площадки, глушить лише себе.
 """
 
 import logging
@@ -29,7 +36,7 @@ from typing import Callable
 import net_probe
 import output_url
 import settings_store
-from backup_prep import BackupPreparer
+from backup_prep import BackupCache, BackupPreparer
 from ffmpeg_proc import FfmpegProcess
 from flv import read_flv_tags
 from switcher import FLVSwitcher, OutputSink
@@ -55,11 +62,63 @@ CONNECT_TIMEOUT_TOAST_COOLDOWN_SEC = 15
 # фактична каденція = час замірів + ця пауза.
 PING_INTERVAL_SEC = 3
 
+# Вікно кореляції "штатний стоп OBS <-> обрив доп-пайплайна" (оракул,
+# §7). Доп-пайплайн, що обірвався в межах цього вікна від штатного
+# стопу дефолтного, трактує це як штатне завершення (без заглушки).
+ORACLE_WINDOW_SEC = 1.5
+
+# Поля старого "плоского" конфіга (до колекції pipelines), що
+# переїхали ВСЕРЕДИНУ пайплайна. При першому _persist() менеджер
+# мігрує їх у pipelines[] і прибирає з верхнього рівня.
+# `offline_timeout_sec` тут НЕМА -- він лишається ГЛОБАЛЬНИМ top-level
+# полем (один OBS -> одне вікно очікування повернення; таймер веде лише
+# дефолтний пайплайн, його спрацювання гасить усі).
+_FLAT_PIPELINE_KEYS = (
+    "live_path", "backup_file",
+    "output_video_bitrate_kbps", "output_audio_bitrate_kbps",
+    "primary_name", "primary_server", "primary_key", "primary_enabled",
+    "primary_url", "twitch_url", "restreams",
+)
+
 
 def _safe_proc_name(name: str) -> str:
-    # Ім'я площадки йде в ім'я лог-файлу ffmpeg (ffmpeg-out-<name>.log) --
+    # Ім'я йде в ім'я лог-файлу ffmpeg (ffmpeg-<name>.log) --
     # прибираємо все, що не годиться для імені файлу.
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name) or "unnamed"
+
+
+def _pipeline_from_flat(config: dict) -> dict:
+    """Зібрати єдиний дефолтний пайплайн зі старих плоских top-level полів (back-compat)."""
+    primary_server = config.get("primary_server") or config.get("primary_url") or config.get("twitch_url", "")
+    return {
+        "name": "main",
+        "is_default": True,
+        "enabled": True,
+        "live_path": config.get("live_path", "live/main"),
+        "backup_file": config.get("backup_file", ""),
+        "primary_name": config.get("primary_name", "primary"),
+        "primary_server": primary_server,
+        "primary_key": config.get("primary_key", ""),
+        "primary_enabled": config.get("primary_enabled", True),
+        "restreams": config.get("restreams", []),
+    }
+
+
+def normalize_pipelines(config: dict) -> list[dict]:
+    """
+    Список конфіг-словників пайплайнів. Якщо `pipelines` немає (старий
+    плоский конфіг) -- мігруємо в один дефолтний пайплайн. Гарантуємо
+    рівно один `is_default` (перший, якщо жоден не помічений).
+    """
+    raw = config.get("pipelines")
+    if not isinstance(raw, list):
+        return [_pipeline_from_flat(config)]
+    pipelines = [p for p in raw if isinstance(p, dict) and p.get("name")]
+    if not pipelines:
+        return [_pipeline_from_flat(config)]
+    if not any(p.get("is_default") for p in pipelines):
+        pipelines[0]["is_default"] = True
+    return pipelines
 
 
 class Destination:
@@ -72,7 +131,7 @@ class Destination:
     при наступному (пере)запуску без перестворення процесу.
     """
 
-    def __init__(self, name: str, server: str, key: str, is_primary: bool, enabled: bool, controller, log_dir: Path):
+    def __init__(self, name: str, server: str, key: str, is_primary: bool, enabled: bool, pipeline, log_dir: Path):
         self.name = name
         self.server = server
         self.key = key
@@ -86,9 +145,12 @@ class Destination:
         self.rtt_ms: int | None = None
 
         self.sink = OutputSink(name, is_primary=is_primary)
-        self._controller = controller
+        self._pipeline = pipeline
+        # Ім'я процесу тегуємо пайплайном -- лог-файли й компоненти
+        # дашборда не конфліктують між пайплайнами з однаковими іменами
+        # площадок.
         self.proc = FfmpegProcess(
-            f"out-{_safe_proc_name(name)}",
+            f"out-{_safe_proc_name(pipeline.name)}-{_safe_proc_name(name)}",
             self._build_args,
             log_dir,
             stdin_pipe=True,
@@ -108,79 +170,81 @@ class Destination:
         ]
 
     def _on_start(self, proc):
-        self._controller.switcher.register_sink(self.sink)
-        self.sink.attach(proc.stdin, self._controller.switcher.current_headers())
+        self._pipeline.switcher.register_sink(self.sink)
+        self.sink.attach(proc.stdin, self._pipeline.switcher.current_headers())
 
     def _on_flapping(self, never_succeeded: bool):
-        self._controller._on_destination_flapping(self, never_succeeded)
+        self._pipeline._on_destination_flapping(self, never_succeeded)
 
 
-class Controller:
-    def __init__(self, config: dict, base_dir: Path, config_path: Path | None = None):
-        self.config = config
+class Pipeline:
+    """
+    Один незалежний канонічний потік (див. докстринг модуля). `pcfg` --
+    конфіг-словник саме цього пайплайна (name/is_default/enabled/
+    live_path/backup_file/offline_timeout_sec/бітрейти/primary_*/
+    restreams). `global_config` — спільний top-level конфіг (mediamtx-
+    креди, read_timeout_ms тощо), читається живцем, тож live-apply
+    глобальних налаштувань підхоплюється без перестворення пайплайна.
+    """
+
+    def __init__(self, manager, pcfg: dict, global_config: dict, base_dir: Path, log_dir: Path):
+        self._manager = manager
+        self.pcfg = pcfg
+        self._gcfg = global_config
         self.base_dir = base_dir
-        self.config_path = config_path or (base_dir / "controller" / "config.json")
-        self.log_dir = base_dir / "controller"
+        self.log_dir = log_dir
+
+        self.name = pcfg["name"]
+        self.is_default = bool(pcfg.get("is_default", False))
+        self.enabled = bool(pcfg.get("enabled", True))
+        self.live_path = pcfg["live_path"]
+
         self.lock = threading.RLock()
         self.state = STATE_OFFLINE
         self._state_since = time.time()
         self._timeout_timer: threading.Timer | None = None
         self._fallback_deadline: float | None = None
+        # Оракул: відкладена перепроверка "чи це був штатний стоп" (§7).
+        self._oracle_timer: threading.Timer | None = None
         self._last_flapping_toast_at = 0.0
-        self._last_connect_timeout_toast_at = 0.0
-        self._stopping = threading.Event()
         # OFFLINE через помилку (жодна площадка не досяжна), а не через
-        # свідомий стоп/таймаут -- дашборд показує окремий "Halt" бейдж.
+        # свідомий стоп/таймаут -- дашборд показує окремий "Failure" бейдж.
         self._halted = False
 
-        # HALT із дашборда -- session-id латч (лише в пам'яті, без
-        # персиста). obs-source.html генерить `OBSId` на реальному старті
-        # OBS і шле його -> `_last_started_obs_id`. На HALT запам'ятовуємо
-        # цю сесію в `_last_halted_obs_id`. Поки `_last_started ==
-        # _last_halted`: (1) `on_available` ігнорує публікацію (не
-        # рестартимо заглушену сесію -> без "вспышки" й без нескінченного
-        # авто-рестарту, якщо в OBS немає прав на самостоп); (2) obs-source
-        # цієї ж сесії при (пере)підключенні отримує `stop_streaming`.
-        # Новий старт OBS -> новий id -> `_last_started != _last_halted` ->
-        # латч знято, свіжий стрім не глушиться.
-        self._last_started_obs_id: str | None = None
-        self._last_halted_obs_id: str | None = None
-
-        # Необов'язкові колбеки -- підключаються ззовні (controller.py),
-        # сама Controller нічого не знає про HTTP/WS/дашборд.
-        self.on_change: Callable[[], None] | None = None          # зміна стану -> hub.notify
-        self.on_event: Callable[[str, str], None] | None = None   # toast -> hub.push_event
-        self.on_control: Callable[[str], None] | None = None      # команда клієнтам /ws (напр. stop_streaming)
-
-        mtx_host = config["mediamtx_rtmp_host"]
-        mtx_port = config["mediamtx_rtmp_port"]
-        user = config["internal_user"]
-        password = config["internal_pass"]
-        live_path = config["live_path"]
+        mtx_host = global_config["mediamtx_rtmp_host"]
+        mtx_port = global_config["mediamtx_rtmp_port"]
+        user = global_config["internal_user"]
+        password = global_config["internal_pass"]
 
         # MediaMTX приймає логін/пароль для RTMP лише через query-параметри
         # (?user=...&pass=...), а НЕ через звичний rtmp://user:pass@host.
-        live_url = f"rtmp://{mtx_host}:{mtx_port}/{live_path}?user={user}&pass={password}"
+        live_url = f"rtmp://{mtx_host}:{mtx_port}/{self.live_path}?user={user}&pass={password}"
+        self.live_url = live_url
         self._live_probe_url = live_url
 
         self.switcher = FLVSwitcher()
-        self._backup_preparer = BackupPreparer(Path(config["backup_file"]), config)
+        backup_source = settings_store.resolve_backup_path(pcfg.get("backup_file", ""), base_dir)
+        # Цільовий бітрейт заглушки автодетектиться з ВИМІРЯНОГО бітрейту
+        # живого потоку (switcher.source_stats) -- ручного вводу немає.
+        self._backup_preparer = BackupPreparer(
+            backup_source, pcfg, manager._backup_cache, self.switcher.source_stats)
 
+        tag = _safe_proc_name(self.name)
         self.relay = FfmpegProcess(
-            "relay",
+            f"relay-{tag}",
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "warning",
                 "-i", live_url,
                 "-c", "copy",
                 "-f", "flv", "pipe:1",
             ],
-            self.log_dir,
+            log_dir,
             capture_stdout=True,
             on_start=self._make_reader_hook("relay"),
         )
 
         self.backup = FfmpegProcess(
-            "backup",
+            f"backup-{tag}",
             lambda: [
                 "ffmpeg", "-hide_banner", "-loglevel", "warning",
                 "-stream_loop", "-1", "-re",
@@ -188,7 +252,7 @@ class Controller:
                 "-c", "copy",
                 "-f", "flv", "pipe:1",
             ],
-            self.log_dir,
+            log_dir,
             capture_stdout=True,
             on_start=self._make_reader_hook("backup"),
         )
@@ -197,12 +261,12 @@ class Controller:
         # тримає server+key окремо; back-compat зі старим єдиним полем
         # url/twitch_url -- читаємо його як server із порожнім key.
         self.destinations: dict[str, Destination] = {}
-        primary_server = config.get("primary_server") or config.get("primary_url") or config.get("twitch_url", "")
-        primary_key = config.get("primary_key", "")
-        primary_name = config.get("primary_name", "primary")
-        primary_enabled = config.get("primary_enabled", True)
+        primary_server = pcfg.get("primary_server") or pcfg.get("primary_url") or pcfg.get("twitch_url", "")
+        primary_key = pcfg.get("primary_key", "")
+        primary_name = pcfg.get("primary_name", "primary")
+        primary_enabled = pcfg.get("primary_enabled", True)
         self._create_destination(primary_name, primary_server, primary_key, is_primary=True, enabled=primary_enabled)
-        for item in config.get("restreams", []):
+        for item in pcfg.get("restreams", []):
             if not isinstance(item, dict) or not item.get("name"):
                 continue
             server = item.get("server") or item.get("url", "")
@@ -213,38 +277,37 @@ class Controller:
                 is_primary=False, enabled=bool(item.get("enabled", False)),
             )
 
-        threading.Thread(target=self._ping_loop, name="ping", daemon=True).start()
+    # --- невеликі помічники подій (тегуються іменем пайплайна) ---
 
-    # --- обробники подій джерела (source) ---
+    def _emit(self, level: str, text: str) -> None:
+        self._manager.emit_pipeline_event(self, level, text)
 
-    def on_available(self):
+    def _notify(self) -> None:
+        self._manager._notify()
+
+    # --- обробники подій джерела (source). Латч перевіряє менеджер ПЕРЕД
+    # делегуванням, тож тут його вже немає. ---
+
+    def on_available(self) -> None:
         with self.lock:
-            if self._is_current_session_halted():
-                # Ця сесія OBS заглушена з дашборда (HALT) -- не стартуємо
-                # ефір на її (пере)публікацію. Стоп самому OBS шлеться, коли
-                # його obs-source (пере)підключиться (register_source).
-                logging.info(
-                    "OBS is publishing, but this session was halted from the dashboard "
-                    "-> ignoring (not restarting the broadcast)"
-                )
-                return
-
             self._cancel_timeout()
+            self._cancel_oracle()
 
             if self.state == STATE_FALLBACK:
                 # backup лишається активним, поки switcher не перемкне
                 # безшовно через _on_switched_to_relay. Виходи не чіпаємо
                 # -- вони весь час мирорять канонічний потік.
                 logging.info(
-                    "OBS reconnected -> waiting for the first live keyframe in the "
-                    "background, backup video stays active until the seamless switch"
+                    "[%s] OBS reconnected -> waiting for the first live keyframe in the "
+                    "background, backup video stays active until the seamless switch",
+                    self.name,
                 )
                 self.switcher.request_switch("relay", on_switched=self._on_switched_to_relay)
                 self.relay.start()
             else:
                 if self.state == STATE_OFFLINE:
-                    logging.info("OBS started publishing -> starting the broadcast")
-                    self._emit_event("info", "Broadcast started")
+                    logging.info("[%s] OBS started publishing -> starting the broadcast", self.name)
+                    self._emit("info", "Broadcast started")
                     self._last_flapping_toast_at = 0.0
                     self._halted = False
                     for dest in self._enabled_destinations():
@@ -254,9 +317,9 @@ class Controller:
                 self.relay.start()
                 self._set_state(STATE_LIVE)
 
-        # Поза self.lock: ffprobe + можливе перекодування можуть тривати
-        # секунди -- не тримати через них стейт-машину заблокованою.
-        self._backup_preparer.prepare_async(self._live_probe_url)
+            # prepare_async лише СПАВНИТЬ фоновий потік (probe/перекод у
+            # ньому) -- виклик миттєвий, тримати лок безпечно.
+            self._backup_preparer.prepare_async(self._live_probe_url)
 
     def _on_switched_to_relay(self, params_changed: bool):
         """
@@ -271,9 +334,10 @@ class Controller:
                     return
                 if params_changed:
                     logging.warning(
-                        "live parameters changed while OBS was unavailable -> "
+                        "[%s] live parameters changed while OBS was unavailable -> "
                         "reconnecting all platforms with a clean connection instead "
-                        "of a seamless switch"
+                        "of a seamless switch",
+                        self.name,
                     )
                     self.switcher.set_active("relay")
                     for dest in self._enabled_destinations():
@@ -282,13 +346,13 @@ class Controller:
                         dest.proc.stop()
                         dest.proc.start()
                 else:
-                    logging.info("live is ready (first keyframe received) -> seamless switch, stopping the backup video")
+                    logging.info("[%s] live is ready (first keyframe received) -> seamless switch, stopping the backup video", self.name)
                 self._set_state(STATE_LIVE)
                 self.backup.stop()
 
         threading.Thread(target=_finish, daemon=True).start()
 
-    def on_unavailable(self):
+    def on_unavailable(self) -> None:
         with self.lock:
             self.relay.stop()
 
@@ -301,130 +365,137 @@ class Controller:
                 # backup/таймер/стан не чіпаємо.
                 return
 
+            # Аукс-пайплайн НЕ вмикає заглушку, якщо немає «сесії», на яку
+            # спертись: (а) обрив у вікні штатного стопу OBS (оракул §7), або
+            # (б) головний (дефолтний) пайплайн зараз не в ефірі -- аукс
+            # публікувався «сам по собі» (obs-multi-rtmp без старту головного
+            # виходу OBS), його зупинку/обрив ловити нічим. Обидва -> чисто
+            # завершуємо, без backup.
+            if not self.is_default and (
+                self._manager.is_graceful_recent() or not self._manager.is_main_session_live()
+            ):
+                logging.info("[%s] disconnected with no live main session to lean on -> clean end (no backup)", self.name)
+                self._teardown_clean()
+                return
+
             if self._enabled_destinations() and not self._any_enabled_destination_alive():
                 logging.error(
-                    "OBS disconnected, and no enabled platform was ever reached this "
-                    "broadcast -- no point looping the backup video, stopping the broadcast"
+                    "[%s] OBS disconnected, and no enabled platform was ever reached this "
+                    "broadcast -- no point looping the backup video, stopping the broadcast",
+                    self.name,
                 )
                 self._give_up_on_unreachable()
                 return
 
             logging.warning(
-                "OBS disconnected -> switching to backup video, waiting %s s for recovery",
-                self.config["offline_timeout_sec"],
+                "[%s] OBS disconnected -> switching to backup video%s",
+                self.name,
+                f", waiting {self._offline_timeout()} s for recovery" if self.is_default else " (waiting on the default pipeline's timeout)",
             )
             self.switcher.set_active("backup")
             self.backup.start()
-            self._schedule_timeout()
+            if self.is_default:
+                # Лише дефолтний веде offline-таймер (один OBS -> одне вікно
+                # очікування повернення); його спрацювання гасить УСІ пайплайни.
+                self._schedule_timeout()
+            else:
+                # Aux свого таймера НЕ веде -- лише перепровірка оракула
+                # (штатний стоп міг прийти трохи ПІЗНІШЕ за обрив).
+                self._schedule_oracle_recheck()
             self._set_state(STATE_FALLBACK)
 
-    def on_manual_stop(self) -> None:
-        """
-        Негайна зупинка на сигнал "OBS deliberately stopped streaming"
-        від obs-source.html (невидимий Browser Source-скрипт, що полить
-        window.obsstudio.getStatus() і шле stop_broadcast у /ws на
-        переході streaming true -> false). Ловить розрив РАНІШЕ за
-        MediaMTX<->OBS, тому трансляція завершується одразу, без
-        заглушки й таймауту.
-        """
+    def _on_relay_stalled(self):
         with self.lock:
-            # OBS реально зупинився -> сесія завершена, знімаємо латч (і
-            # заглушену, і активну сесію), навіть якщо стан уже OFFLINE
-            # (напр. після HALT, коли obs-source нарешті зупинив OBS).
-            self._last_started_obs_id = None
-            self._last_halted_obs_id = None
+            if self.state != STATE_LIVE:
+                return
+            if not self.is_default and (
+                self._manager.is_graceful_recent() or not self._manager.is_main_session_live()
+            ):
+                logging.info("[%s] relay stalled with no live main session to lean on -> clean end (no backup)", self.name)
+                self._teardown_clean()
+                return
+            logging.warning(
+                "[%s] no data from relay for %sms (network to OBS looks stalled) -> "
+                "switching to backup video without dropping the relay connection",
+                self.name, self._gcfg["read_timeout_ms"],
+            )
+            self.switcher.set_active("backup")
+            self.backup.start()
+            if self.is_default:
+                self._schedule_timeout()
+            else:
+                self._schedule_oracle_recheck()
+            self._set_state(STATE_FALLBACK)
+
+    def _on_relay_resumed(self):
+        with self.lock:
+            if self.state != STATE_FALLBACK:
+                return
+            logging.info("[%s] data from relay resumed -> waiting for a keyframe for a seamless switch back", self.name)
+            self.switcher.request_switch("relay", on_switched=self._on_switched_to_relay)
+
+    # --- завершення (механічне, без OBS-впливу) ---
+
+    def _teardown_clean(self) -> None:
+        """Штатне чисте завершення (стоп vs обрив): усе стоп, стан OFFLINE, без заглушки/таймауту. Під self.lock."""
+        self.relay.stop()
+        self.backup.stop()
+        self._stop_all_destinations()
+        self._cancel_timeout()
+        self._cancel_oracle()
+        self._set_state(STATE_OFFLINE)
+
+    def on_manual_stop(self) -> bool:
+        """Штатний стоп OBS (obs-source.html). Повертає True, якщо був активний ефір. Під self.lock бере сам."""
+        with self.lock:
             if self.state == STATE_OFFLINE:
-                return
-            logging.info("OBS reports streaming stopped (obs-source.html) -> ending the broadcast")
-            self._emit_event("info", "Broadcast ended")
-            self.relay.stop()
-            self.backup.stop()
-            self._stop_all_destinations()
-            self._cancel_timeout()
-            self._set_state(STATE_OFFLINE)
+                return False
+            logging.info("[%s] OBS reports streaming stopped -> ending the broadcast", self.name)
+            self._emit("info", "Broadcast ended")
+            self._teardown_clean()
+            return True
 
-    def on_dashboard_halt(self) -> None:
+    def halt(self) -> bool:
+        """Механічний стоп для HALT/CRUD (менеджер сам вирішує щодо OBS/подій). Повертає True, якщо був активний."""
+        with self.lock:
+            was_active = self.state != STATE_OFFLINE
+            self._teardown_clean()
+            return was_active
+
+    def graceful_stop_if_fallback(self) -> None:
         """
-        Ручний "HALT" з дашборда (червона кнопка в шапці): негайно
-        зупиняє весь ефір (relay/backup/усі виходи) і командує OBS
-        зупинити стрім (`stop_streaming` -> obs-source.html, якщо той
-        має Page permission "Full access to OBS"). Сценарій: користувач
-        відпав (OBS/ПК завис, крутиться backup) і заходить у дашборд з
-        телефона, щоб заглушити трансляцію звідти. Це свідомий стоп ->
-        стан OFFLINE (не FAILURE), `_halted` не виставляємо.
+        Оракул, штатний стоп при aux, УЖЕ сидячому в FALLBACK (§7): такий
+        aux нового on_unavailable не отримає й досидів би весь offline_
+        timeout. Менеджер зве це на всіх aux при on_manual_stop.
         """
         with self.lock:
-            if self.state == STATE_OFFLINE:
-                return
-            logging.warning("HALT requested from the dashboard -> stopping the broadcast and asking OBS to stop")
-            self._emit_event("warning", "Broadcast halted from the dashboard")
-            self.relay.stop()
-            self.backup.stop()
-            self._stop_all_destinations()
-            self._cancel_timeout()
-            # Запамʼятовуємо поточну сесію OBS як заглушену -> латч (див.
-            # on_available). Якщо id невідомий (obs-source жодного разу не
-            # доповів) -- лишається None: HALT спрацює разово (без латча),
-            # заглушити нема за чим.
-            self._last_halted_obs_id = self._last_started_obs_id
-            self._set_state(STATE_OFFLINE)
-            # Одразу шлемо стоп підключеним obs-source (це і є заглушена
-            # сесія); тим, хто підключиться пізніше, шле http_server на
-            # register_source (точково, за збігом obs_id).
-            self._request_stop_streaming_in_obs()
+            if self.state == STATE_FALLBACK:
+                logging.info("[%s] graceful stop while in fallback -> clean end", self.name)
+                self._teardown_clean()
 
-    def report_obs_session(self, obs_id) -> None:
+    def set_master(self, active: bool) -> None:
         """
-        obs-source.html доповів id поточної сесії стриму OBS (у
-        `register_source` при коннекті або в `obs_streaming_started` на
-        реальному старті). Порожній/None ігноруємо (сесія невідома --
-        напр. сторінку джерела перезавантажили посеред стриму), щоб не
-        затерти відомий id.
-        """
-        if not obs_id:
-            return
-        with self.lock:
-            self._last_started_obs_id = obs_id
-
-    def is_session_halted(self, obs_id) -> bool:
-        """Чи саме ця сесія OBS заглушена (для точкового stop_streaming при register_source)."""
-        with self.lock:
-            return bool(obs_id) and obs_id == self._last_halted_obs_id
-
-    def _is_current_session_halted(self) -> bool:
-        # Під self.lock. Латч активний, поки остання відома сесія OBS
-        # збігається із заглушеною.
-        return self._last_halted_obs_id is not None and self._last_started_obs_id == self._last_halted_obs_id
-
-    def on_obs_streaming_started(self) -> None:
-        # Лише лог -- стан і так виставляється через runOnAvailable/
-        # on_available; це підтвердження зі сторони OBS, не тригер.
-        logging.info("OBS reports streaming started (obs-source.html)")
-
-    def on_mediamtx_connect_timeout(self) -> None:
-        """
-        MediaMTX закрив з'єднання OBS по readTimeout, так і не
-        дочекавшись публікації -- runOnAvailable/runOnUnavailable у
-        цьому разі жодного разу не спрацьовують (звідси й приходить цей
-        виклик з mediamtx_log_watch.py).
+        Master AND-гейт над усіма площадками цього пайплайна (тумблер у
+        шапці Control). Сам пайплайн (relay/стейт-машина) продовжує йти за
+        публікацією OBS -- гейт лише вирішує, чи щось реально віддається
+        назовні. OFF -> глушимо всі виходи; ON -> піднімаємо ті, що мають
+        власну галочку, якщо ефір активний. Індивідуальні галочки площадок
+        зберігаються (гейт їх лише пригнічує). Під self.lock бере сам.
         """
         with self.lock:
-            if self.state != STATE_OFFLINE:
+            if self.enabled == active:
                 return
-            now = time.monotonic()
-            if now - self._last_connect_timeout_toast_at < CONNECT_TIMEOUT_TOAST_COOLDOWN_SEC:
-                return
-            self._last_connect_timeout_toast_at = now
-        logging.warning(
-            "OBS failed to finish connecting to MediaMTX within the connect timeout -- "
-            "consider raising it in Settings"
-        )
-        self._emit_event(
-            "warning",
-            "OBS didn't finish connecting in time -- try raising the connect timeout in Settings",
-        )
+            self.enabled = active
+            if not active:
+                self._stop_all_destinations()
+                logging.info("[%s] all platforms muted (pipeline keeps running)", self.name)
+            else:
+                if self.state in (STATE_LIVE, STATE_FALLBACK):
+                    for dest in self._enabled_destinations():
+                        self._start_destination(dest)
+                logging.info("[%s] platforms un-muted", self.name)
 
-    # --- керування виходами (Control / Settings) ---
+    # --- керування виходами (механіка; персист/роутинг -- на менеджері) ---
 
     def enable_destination(self, name: str) -> None:
         with self.lock:
@@ -432,13 +503,13 @@ class Controller:
             if dest is None or dest.enabled:
                 return
             dest.enabled = True
-            if self.state in (STATE_LIVE, STATE_FALLBACK):
+            if self.enabled and self.state in (STATE_LIVE, STATE_FALLBACK):
                 self._start_destination(dest)
-                logging.info("enabled platform %s (started live)", name)
+                logging.info("[%s] enabled platform %s (started live)", self.name, name)
+            elif not self.enabled:
+                logging.info("[%s] enabled platform %s (pipeline muted -- starts when the pipeline toggle is on)", self.name, name)
             else:
-                logging.info("enabled platform %s (will start on next broadcast)", name)
-            self._sync_outputs_config()
-            self._persist()
+                logging.info("[%s] enabled platform %s (will start on next broadcast)", self.name, name)
 
     def disable_destination(self, name: str) -> None:
         with self.lock:
@@ -448,22 +519,13 @@ class Controller:
             dest.enabled = False
             dest.failed = False
             self._stop_destination(dest)
-            logging.info("disabled platform %s", name)
-            self._sync_outputs_config()
-            self._persist()
-
-    # --- негайний CRUD площадок (вкладка Settings) -- кожна дія
-    # застосовується одразу й персиститься, як enable/disable; окремого
-    # Apply тут нема (Apply лишився тільки для System-блоку). Викликач
-    # (http_server) відповідає за попередню валідацію.
+            logging.info("[%s] disabled platform %s", self.name, name)
 
     def add_destination(self, name: str, server: str, key: str) -> None:
         with self.lock:
             # Нова площадка -- вимкнена; вмикає користувач у Control.
             self._create_destination(name, server, key, is_primary=False, enabled=False)
-            logging.info("added platform %s", name)
-            self._sync_outputs_config()
-            self._persist()
+            logging.info("[%s] added platform %s", self.name, name)
 
     def update_destination(self, name: str, new_name: str, server: str, key: str) -> None:
         with self.lock:
@@ -477,19 +539,17 @@ class Controller:
                 is_primary = dest.is_primary
                 self._remove_destination(dest)
                 new_dest = self._create_destination(new_name, server, key, is_primary=is_primary, enabled=was_enabled)
-                if was_enabled and self.state in (STATE_LIVE, STATE_FALLBACK):
+                if was_enabled and self.enabled and self.state in (STATE_LIVE, STATE_FALLBACK):
                     self._start_destination(new_dest)
             else:
                 changed = server != dest.server or key != dest.key
                 dest.server = server
                 dest.key = key
                 dest.url = output_url.build_push_url(server, key)
-                if changed and dest.enabled and self.state in (STATE_LIVE, STATE_FALLBACK):
+                if changed and dest.enabled and self.enabled and self.state in (STATE_LIVE, STATE_FALLBACK):
                     dest.proc.stop()  # bounce лише цієї площадки з новим URL
                     dest.proc.start()
-            logging.info("updated platform %s", new_name)
-            self._sync_outputs_config()
-            self._persist()
+            logging.info("[%s] updated platform %s", self.name, new_name)
 
     def remove_destination(self, name: str) -> None:
         with self.lock:
@@ -497,31 +557,17 @@ class Controller:
             if dest is None or dest.is_primary:
                 return  # primary незнищенний
             self._remove_destination(dest)
-            logging.info("removed platform %s", name)
-            self._sync_outputs_config()
-            self._persist()
+            logging.info("[%s] removed platform %s", self.name, name)
 
-    def apply_settings(self, values: dict) -> None:
-        """
-        System-блок вкладки Settings: `backup_file`, `offline_timeout_sec`,
-        `connect_timeout_ms`, `read_timeout_ms`. Оновлює `self.config` у
-        пам'яті й застосовує backup_file живцем (новий BackupPreparer).
-        Тайминги MediaMTX застосовує викликач окремо (mediamtx_control).
-        Платформи сюди НЕ входять -- ними керують add/update/remove/enable/
-        disable, кожна негайно. Викликати без self.lock -- бере сам.
-        """
+    def apply_local_settings(self, backup_file: str | None) -> None:
+        """Per-pipeline поля живцем (backup_file -> новий BackupPreparer). offline_timeout/бітрейти тут нема (глобальний / автодетект). Під self.lock бере сам."""
         with self.lock:
-            self.config["offline_timeout_sec"] = int(values["offline_timeout_sec"])
-            self.config["connect_timeout_ms"] = int(values["connect_timeout_ms"])
-            self.config["read_timeout_ms"] = int(values["read_timeout_ms"])
-            self.config["icmp_ping"] = bool(values.get("icmp_ping", False))
-
-            new_backup = str(settings_store.resolve_backup_path(values["backup_file"], self.base_dir))
-            if new_backup != self.config.get("backup_file"):
-                self.config["backup_file"] = new_backup
-                self._backup_preparer = BackupPreparer(Path(new_backup), self.config)
-
-            self._persist()
+            if backup_file is not None:
+                new_backup = str(settings_store.resolve_backup_path(backup_file, self.base_dir))
+                if new_backup != str(settings_store.resolve_backup_path(self.pcfg.get("backup_file", ""), self.base_dir)):
+                    self.pcfg["backup_file"] = backup_file
+                    self._backup_preparer = BackupPreparer(
+                        Path(new_backup), self.pcfg, self._manager._backup_cache, self.switcher.source_stats)
 
     def outputs_for_settings(self) -> list[dict]:
         """Дані площадок для вкладки Settings: server/key (префіл модалки) + фінальний url (маскований показ)."""
@@ -540,7 +586,15 @@ class Controller:
             out.sort(key=lambda d: not d["is_primary"])  # primary завжди першим
             return out
 
-    # --- статус / життєвий цикл ---
+    def destination_names(self) -> list[str]:
+        with self.lock:
+            return [d.name for d in self.destinations.values()]
+
+    def list_destinations(self) -> list[Destination]:
+        with self.lock:
+            return list(self.destinations.values())
+
+    # --- статус / конфіг / життєвий цикл ---
 
     def status(self) -> dict:
         with self.lock:
@@ -570,10 +624,12 @@ class Controller:
             dests.sort(key=lambda d: not d["is_primary"])  # primary завжди першим
 
             return {
+                "name": self.name,
+                "is_default": self.is_default,
+                "enabled": self.enabled,
                 "state": self.state,
                 "state_since": self._state_since,
                 "halted": self._halted,
-                "manual_halt": self._is_current_session_halted(),
                 "obs": obs,
                 "relay_running": self.relay.is_running(),
                 "relay_pid": self.relay.pid(),
@@ -583,10 +639,29 @@ class Controller:
                 "destinations": dests,
             }
 
-    def shutdown(self):
+    def to_config(self) -> dict:
         with self.lock:
-            self._stopping.set()
+            primary = self._primary_destination()
+            return {
+                "name": self.name,
+                "is_default": self.is_default,
+                "enabled": self.enabled,
+                "live_path": self.live_path,
+                "backup_file": self.pcfg.get("backup_file", ""),
+                "primary_name": primary.name,
+                "primary_server": primary.server,
+                "primary_key": primary.key,
+                "primary_enabled": primary.enabled,
+                "restreams": [
+                    {"name": d.name, "server": d.server, "key": d.key, "enabled": d.enabled}
+                    for d in self.destinations.values() if not d.is_primary
+                ],
+            }
+
+    def shutdown(self) -> None:
+        with self.lock:
             self._cancel_timeout()
+            self._cancel_oracle()
             self.relay.stop()
             self.backup.stop()
             for dest in self.destinations.values():
@@ -598,7 +673,7 @@ class Controller:
     def _create_destination(self, name: str, server: str, key: str, is_primary: bool, enabled: bool) -> Destination:
         dest = Destination(name, server, key, is_primary, enabled, self, self.log_dir)
         self.destinations[name] = dest
-        if enabled and self.state in (STATE_LIVE, STATE_FALLBACK):
+        if enabled and self.enabled and self.state in (STATE_LIVE, STATE_FALLBACK):
             self._start_destination(dest)
         return dest
 
@@ -622,6 +697,10 @@ class Controller:
             self._stop_destination(dest)
 
     def _enabled_destinations(self) -> list[Destination]:
+        # Master-гейт (self.enabled) закритий -> назовні не віддаємо нічого,
+        # хоч би які були індивідуальні галочки площадок (AND-семантика).
+        if not self.enabled:
+            return []
         return [d for d in self.destinations.values() if d.enabled]
 
     def _any_enabled_destination_alive(self) -> bool:
@@ -640,7 +719,7 @@ class Controller:
         if never_succeeded:
             # Жодного успішного під'єднання цієї площадки від старту --
             # майже напевно невалідний URL/ключ. Зупиняємо ЇЇ (повторні
-            # спроби нічого не змінять), а весь ефір рубаємо лише якщо
+            # спроби нічого не змінять), а весь пайплайн рубаємо лише якщо
             # це була остання жива площадка (агрегатний failsafe).
             with self.lock:
                 if self.state == STATE_OFFLINE:
@@ -649,15 +728,16 @@ class Controller:
                 self._stop_destination(dest)
                 if self._enabled_destinations() and not self._any_enabled_destination_alive():
                     logging.error(
-                        "no enabled platform could be reached this broadcast -- stopping the broadcast"
+                        "[%s] no enabled platform could be reached this broadcast -- stopping this pipeline",
+                        self.name,
                     )
                     self._give_up_on_unreachable()
                 else:
                     logging.warning(
-                        "%s failed to connect (likely invalid URL/key) -- other platforms keep streaming",
-                        dest.name,
+                        "[%s] %s failed to connect (likely invalid URL/key) -- other platforms keep streaming",
+                        self.name, dest.name,
                     )
-                    self._emit_event(
+                    self._emit(
                         "warning",
                         f"{dest.name}: failed to connect -- check its URL/key. Other platforms keep streaming.",
                     )
@@ -667,45 +747,31 @@ class Controller:
         # мережевий збій, не невалідний ключ. Ретраїмо нескінченно
         # (супервізор), лише антиспам тостів.
         logging.warning(
-            "%s keeps failing after a previously working connection -- possible network issue, still retrying",
-            dest.name,
+            "[%s] %s keeps failing after a previously working connection -- possible network issue, still retrying",
+            self.name, dest.name,
         )
         now = time.monotonic()
         with self.lock:
             if now - self._last_flapping_toast_at < FLAPPING_TOAST_COOLDOWN_SEC:
                 return
             self._last_flapping_toast_at = now
-        self._emit_event("warning", f"{dest.name}: connection keeps failing -- still retrying...")
+        self._emit("warning", f"{dest.name}: connection keeps failing -- still retrying...")
 
     def _give_up_on_unreachable(self) -> None:
         """
-        Спільний хвіст, коли жодна увімкнена площадка не досяжна (обидва
-        шляхи: агрегат never_succeeded і on_unavailable без жодної живої
-        площадки). Зупиняє все на нашому боці й командує OBS зупинити
-        стрім (якщо obs-source.html підключений із Page permission "Full
-        access to OBS"). Викликати під self.lock.
+        Жодна увімкнена площадка цього пайплайна не досяжна. Зупиняє все
+        на нашому боці й делегує менеджеру рішення про OBS-стоп
+        (failsafe-асиметрія §8: OBS глушиться лише якщо це дефолтний
+        пайплайн АБО померли всі). Викликати під self.lock.
         """
         self.relay.stop()
         self.backup.stop()
         self._stop_all_destinations()
         self._cancel_timeout()
+        self._cancel_oracle()
         self._halted = True
         self._set_state(STATE_OFFLINE)
-        self._emit_event(
-            "error",
-            "Couldn't connect to any enabled platform -- check the URLs/keys in Settings. "
-            "Broadcast stopped, and a stop command was sent to the OBS browser-source. If OBS "
-            "is still streaming, set its Page permission to \"Full access to OBS\".",
-        )
-        self._request_stop_streaming_in_obs()
-
-    def _request_stop_streaming_in_obs(self) -> None:
-        logging.info(
-            "sending stop_streaming control to any connected obs-source.html "
-            "(requires its Page permission set to \"Full access to OBS\" to take effect)"
-        )
-        if self.on_control is not None:
-            self.on_control("stop_streaming")
+        self._manager.on_pipeline_gave_up(self)
 
     # --- внутрішнє: source-детектори ---
 
@@ -716,7 +782,7 @@ class Controller:
             kwargs = {}
             if is_relay:
                 kwargs = {
-                    "read_timeout_sec": self.config["read_timeout_ms"] / 1000,
+                    "read_timeout_sec": self._gcfg["read_timeout_ms"] / 1000,
                     "on_stall": self._on_relay_stalled,
                     "on_resume": self._on_relay_resumed,
                 }
@@ -728,68 +794,21 @@ class Controller:
             ).start()
         return on_start
 
-    def _on_relay_stalled(self):
-        with self.lock:
-            if self.state != STATE_LIVE:
-                return
-            logging.warning(
-                "no data from relay for %sms (network to OBS looks stalled) -> "
-                "switching to backup video without dropping the relay connection",
-                self.config["read_timeout_ms"],
-            )
-            self.switcher.set_active("backup")
-            self.backup.start()
-            self._schedule_timeout()
-            self._set_state(STATE_FALLBACK)
+    # --- внутрішнє: стан/таймер/оракул ---
 
-    def _on_relay_resumed(self):
-        with self.lock:
-            if self.state != STATE_FALLBACK:
-                return
-            logging.info("data from relay resumed -> waiting for a keyframe for a seamless switch back")
-            self.switcher.request_switch("relay", on_switched=self._on_switched_to_relay)
-
-    # --- внутрішнє: стан/конфіг/таймер ---
+    def _offline_timeout(self) -> int:
+        # Глобальне поле (один OBS -> одне вікно очікування). Веде таймер
+        # лише дефолтний пайплайн; його спрацювання гасить усі.
+        return int(self._gcfg.get("offline_timeout_sec", 1800))
 
     def _set_state(self, new_state: str) -> None:
         self.state = new_state
         self._state_since = time.time()
         self._notify()
 
-    def _notify(self) -> None:
-        if self.on_change is not None:
-            self.on_change()
-
-    def _emit_event(self, level: str, text: str) -> None:
-        if self.on_event is not None:
-            self.on_event(level, text)
-
-    def _sync_outputs_config(self) -> None:
-        # Дзеркалимо поточні площадки в self.config (server+key роздільно,
-        # не зібраний url) -- звідси _persist() пише їх у config.json.
-        # Прибираємо застарілі одинарні поля (primary_url/twitch_url), щоб
-        # back-compat-читання не воскрешало старе значення після правки.
-        primary = self._primary_destination()
-        self.config["primary_name"] = primary.name
-        self.config["primary_server"] = primary.server
-        self.config["primary_key"] = primary.key
-        self.config["primary_enabled"] = primary.enabled
-        self.config.pop("primary_url", None)
-        self.config.pop("twitch_url", None)
-        self.config["restreams"] = [
-            {"name": d.name, "server": d.server, "key": d.key, "enabled": d.enabled}
-            for d in self.destinations.values() if not d.is_primary
-        ]
-
-    def _persist(self) -> None:
-        try:
-            settings_store.persist(self.config_path, self.config)
-        except OSError:
-            logging.exception("failed to persist config.json")
-
     def _schedule_timeout(self):
         self._cancel_timeout()
-        timeout_sec = self.config["offline_timeout_sec"]
+        timeout_sec = self._offline_timeout()
         self._fallback_deadline = time.time() + timeout_sec
         self._timeout_timer = threading.Timer(timeout_sec, self._on_timeout)
         self._timeout_timer.daemon = True
@@ -802,27 +821,610 @@ class Controller:
         self._fallback_deadline = None
 
     def _on_timeout(self):
+        # Лише дефолтний пайплайн заводить цей таймер (один OBS -> одне
+        # вікно). OBS не повернувся -> кінець усієї сесії: гасимо УСІ
+        # пайплайни через менеджер. Викликаємо ПОЗА self.lock (з Timer-
+        # потоку) -> без інверсії Pipeline->Manager.
         with self.lock:
             if self.state != STATE_FALLBACK:
                 return
-            logging.warning(
-                "gave up waiting for OBS to recover after %s s -> ending the broadcast entirely",
-                self.config["offline_timeout_sec"],
-            )
-            self._emit_event("warning", "Broadcast ended -- OBS did not reconnect in time")
-            self.backup.stop()
-            self._stop_all_destinations()
             self._cancel_timeout()
-            self._set_state(STATE_OFFLINE)
+        logging.warning(
+            "gave up waiting for OBS to recover after %s s -> ending the broadcast (all pipelines)",
+            self._offline_timeout(),
+        )
+        self._manager.on_offline_timeout()
+
+    def _schedule_oracle_recheck(self):
+        # Під self.lock. Доп-пайплайн у FALLBACK: перепровірити, чи не
+        # прийшов штатний стоп трохи пізніше за обрив (§7).
+        self._cancel_oracle()
+        self._oracle_timer = threading.Timer(ORACLE_WINDOW_SEC, self._oracle_recheck)
+        self._oracle_timer.daemon = True
+        self._oracle_timer.start()
+
+    def _cancel_oracle(self):
+        if self._oracle_timer is not None:
+            self._oracle_timer.cancel()
+            self._oracle_timer = None
+
+    def _oracle_recheck(self):
+        with self.lock:
+            # No-op, якщо OBS уже повернувся (реконнект почав безшовний
+            # cut) або стан уже не FALLBACK -- не затираємо початий
+            # _on_relay_resumed/_on_switched_to_relay.
+            if self.state != STATE_FALLBACK:
+                return
+            if self.switcher.pending_source is not None:
+                return
+            if self._manager.is_graceful_recent():
+                logging.info("[%s] graceful stop confirmed after the drop -> clean end (no backup)", self.name)
+                self._teardown_clean()
+
+
+class Manager:
+    """
+    Верхній рівень: те, що завʼязано на "один OBS". Створює пайплайни з
+    `config["pipelines"]` (з back-compat міграцією плоского конфіга),
+    роутить хуки MediaMTX по шляху, тримає session-латч і оракул,
+    персистить конфіг, крутить ping-петлю. Колбеки в hub
+    (on_change/on_event/on_control) підключаються ззовні (controller.py).
+    """
+
+    def __init__(self, config: dict, base_dir: Path, config_path: Path | None = None):
+        self.config = config
+        self.base_dir = base_dir
+        self.config_path = config_path or (base_dir / "data" / "config.json")
+        self.log_dir = base_dir / "logs"
+        self.lock = threading.RLock()
+        self._stopping = threading.Event()
+
+        # Для показу готового OBS Stream Key кожного пайплайна в дашборді
+        # (динамічні шляхи -> замість комбобокса показуємо, КУДИ публікувати).
+        self._public_host = config.get("public_host", "")
+        self._rtmp_port = config.get("mediamtx_rtmp_port", 1935)
+        self._obs_ingest_pass = config.get("obs_pass", "")
+
+        # HALT із дашборда -- session-id латч (лише в пам'яті, без
+        # персиста). obs-source.html генерить `OBSId` на реальному старті
+        # OBS і шле його -> `_last_started_obs_id`. На HALT запам'ятовуємо
+        # цю сесію в `_last_halted_obs_id`. Латч ГЛОБАЛЬНИЙ (один OBS) --
+        # діє на всі пайплайни цієї OBS-сесії.
+        self._last_started_obs_id: str | None = None
+        self._last_halted_obs_id: str | None = None
+        self._last_connect_timeout_toast_at = 0.0
+
+        # Оракул штатного стопу (§7): monotonic() останнього штатного
+        # стопу OBS. Читається доп-пайплайнами БЕЗ Manager.lock (простий
+        # read float під GIL) -- щоб уникнути інверсії Pipeline->Manager.
+        self._graceful_stop_at: float | None = None
+
+        # Колбеки в hub -- підключаються ззовні (controller.py).
+        self.on_change: Callable[[], None] | None = None
+        self.on_event: Callable[[str, str], None] | None = None
+        self.on_control: Callable[[str], None] | None = None
+
+        # Спільний контент-адресуемий кэш готових заглушок (§6.9): один
+        # вихідний файл, спільний для кількох пайплайнів, готується під
+        # СВОЇ параметри кожного, без thrashing; однакові (джерело+
+        # параметри) -- рівно один транскод.
+        self._backup_cache = BackupCache(self.base_dir / "data" / "backup-cache")
+
+        self.pipelines: dict[str, Pipeline] = {}
+        self._by_path: dict[str, Pipeline] = {}
+        # Пряме посилання на дефолтний пайплайн (оновлюється в
+        # _instantiate_pipeline під Manager.lock). Аукс-пайплайни читають
+        # його стан БЕЗ Manager.lock (is_main_session_live) -- щоб не було
+        # інверсії Pipeline->Manager; тому кеш, а не пошук по dict.
+        self._default: Pipeline | None = None
+        for pcfg in normalize_pipelines(config):
+            self._instantiate_pipeline(pcfg)
+
+        threading.Thread(target=self._ping_loop, name="ping", daemon=True).start()
+
+    def _instantiate_pipeline(self, pcfg: dict) -> Pipeline:
+        pipeline = Pipeline(self, pcfg, self.config, self.base_dir, self.log_dir)
+        self.pipelines[pipeline.name] = pipeline
+        self._by_path[pipeline.live_path] = pipeline
+        if pipeline.is_default:
+            self._default = pipeline
+        return pipeline
+
+    def _default_pipeline(self) -> Pipeline:
+        for p in self.pipelines.values():
+            if p.is_default:
+                return p
+        # інваріант normalize_pipelines: рівно один is_default; але про
+        # всяк -- перший.
+        return next(iter(self.pipelines.values()))
+
+    def _pipeline_for_path(self, path: str | None) -> Pipeline | None:
+        if path is None:
+            # Back-compat: хук без ?path (одношляхова конфігурація) ->
+            # дефолтний пайплайн.
+            return self._default_pipeline()
+        return self._by_path.get(path)
+
+    # --- хуки MediaMTX (роутинг по шляху) ---
+
+    def on_available(self, path: str | None = None) -> None:
+        with self.lock:
+            pipeline = self._pipeline_for_path(path)
+            if pipeline is None:
+                logging.warning("available hook for unknown path %r -- ignoring", path)
+                return
+            # Життєвий цикл пайплайна керується ЛИШЕ публікацією OBS на його
+            # шлях (немає ручного disable-пайплайна). Тумблер у шапці Control
+            # -- це master AND-гейт над площадками (Pipeline.enabled), а не
+            # гейт запуску самого пайплайна: тут його НЕ перевіряємо.
+            if self._is_current_session_halted():
+                # Ця сесія OBS заглушена з дашборда (HALT) -- не стартуємо
+                # ефір на її (пере)публікацію. Латч глобальний: діє на всі
+                # пайплайни цієї сесії. Стоп самому OBS шлеться, коли його
+                # obs-source (пере)підключиться (register_source).
+                logging.info(
+                    "OBS is publishing (path=%s), but this session was halted from the dashboard "
+                    "-> ignoring (not restarting the broadcast)", path,
+                )
+                return
+            pipeline.on_available()
+
+    def on_unavailable(self, path: str | None = None) -> None:
+        with self.lock:
+            pipeline = self._pipeline_for_path(path)
+            if pipeline is None:
+                logging.warning("unavailable hook for unknown path %r -- ignoring", path)
+                return
+            pipeline.on_unavailable()
+
+    # --- сигнали OBS / латч / оракул ---
+
+    def on_manual_stop(self) -> None:
+        """
+        Штатний стоп OBS (obs-source.html). Негайно чисто завершує
+        дефолтний пайплайн (він наблюдаемий), ставить оракул і чистить
+        латч. Доп-пайплайни: ті, що вже в FALLBACK, теж чисто завершуємо
+        (нового on_unavailable вони не отримають, §7); решта доловить
+        оракул на своєму наступному обриві.
+        """
+        with self.lock:
+            self._last_started_obs_id = None
+            self._last_halted_obs_id = None
+            self._graceful_stop_at = time.monotonic()
+            default = self._default_pipeline()
+            default.on_manual_stop()
+            for pipeline in self.pipelines.values():
+                if pipeline is not default:
+                    pipeline.graceful_stop_if_fallback()
+
+    def on_dashboard_halt(self) -> None:
+        """
+        Ручний "HALT" з дашборда: негайно зупиняє ВСІ пайплайни й
+        командує OBS зупинити стрім. Це свідомий стоп -> стан OFFLINE
+        (не FAILURE). Латч глобальний.
+        """
+        with self.lock:
+            any_active = False
+            for pipeline in self.pipelines.values():
+                if pipeline.halt():
+                    any_active = True
+            if not any_active:
+                return
+            logging.warning("HALT requested from the dashboard -> stopping all pipelines and asking OBS to stop")
+            self._emit_event("warning", "Broadcast halted from the dashboard")
+            # Запамʼятовуємо поточну сесію OBS як заглушену -> латч.
+            self._last_halted_obs_id = self._last_started_obs_id
+            # Одразу шлемо стоп підключеним obs-source; тим, хто
+            # підключиться пізніше, шле http_server на register_source.
+            self._request_stop_streaming_in_obs()
+
+    def on_pipeline_gave_up(self, pipeline: Pipeline) -> None:
+        """
+        Пайплайн заглушив себе (жодна площадка не піднялась). Рішення про
+        OBS-стоп (failsafe-асиметрія §8) виконуємо НЕ синхронно під локом-
+        звонарем (pipeline.lock, іноді супервізорний потік): диспатчимо в
+        окремий потік, де беремо Manager.lock і опитуємо інші пайплайни --
+        так уникаємо інверсії Pipeline->Manager проти Manager->Pipeline.
+        """
+        def _decide():
+            with self.lock:
+                if pipeline.is_default:
+                    logging.error("default pipeline failed -- asking OBS to stop the whole stream")
+                    self._emit_event(
+                        "error",
+                        "Couldn't connect to any enabled platform on the main pipeline -- check the "
+                        "URLs/keys in Settings. Broadcast stopped, and a stop command was sent to the "
+                        "OBS browser-source. If OBS is still streaming, set its Page permission to "
+                        "\"Full access to OBS\".",
+                    )
+                    self._request_stop_streaming_in_obs()
+                    return
+                if not self._any_pipeline_alive():
+                    logging.error("all pipelines are down -- asking OBS to stop the whole stream")
+                    self._emit_event(
+                        "error",
+                        "Every pipeline is down -- check the URLs/keys in Settings. Broadcast stopped, "
+                        "and a stop command was sent to the OBS browser-source.",
+                    )
+                    self._request_stop_streaming_in_obs()
+                    return
+                # Хоч один пайплайн ще живий -- глушимо лише цей, OBS не чіпаємо.
+                logging.warning(
+                    "pipeline %s gave up -- other pipelines keep streaming, OBS not touched", pipeline.name,
+                )
+                self._emit_event(
+                    "warning",
+                    f"[{pipeline.name}] couldn't connect to any platform -- this pipeline stopped. "
+                    "The main broadcast keeps going.",
+                )
+
+        threading.Thread(target=_decide, daemon=True).start()
+
+    def _any_pipeline_alive(self) -> bool:
+        # Під Manager.lock. "Живий" = увімкнений і не в OFFLINE.
+        for p in self.pipelines.values():
+            if p.enabled and p.state != STATE_OFFLINE:
+                return True
+        return False
+
+    def is_graceful_recent(self) -> bool:
+        # Читається пайплайнами БЕЗ Manager.lock (уникаємо інверсії).
+        at = self._graceful_stop_at
+        return at is not None and (time.monotonic() - at) < ORACLE_WINDOW_SEC
+
+    def is_main_session_live(self) -> bool:
+        """
+        Чи ГОЛОВНИЙ (дефолтний) пайплайн зараз у живій сесії (не OFFLINE).
+        Аукс-пайплайн спирається на це, вирішуючи, чи вмикати заглушку:
+        його continuity піггібечить на сесію дефолта (аукс навіть чекає на
+        offline-таймер дефолта). Якщо дефолт не в ефірі -- аукс публікувався
+        «сам по собі» (obs-multi-rtmp без старту головного виходу OBS), його
+        зупинку/обрив ловити нічим (немає оракула) -> заглушку не вмикаємо.
+        Читається БЕЗ Manager.lock (простий read рядка-стану під GIL;
+        посилання на дефолт кешоване) -- уникаємо інверсії Pipeline->Manager.
+        """
+        d = self._default
+        return d is not None and d.state != STATE_OFFLINE
+
+    def report_obs_session(self, obs_id) -> None:
+        """
+        obs-source.html доповів id поточної сесії стриму OBS. Порожній/
+        None ігноруємо (сесія невідома), щоб не затерти відомий id.
+        """
+        if not obs_id:
+            return
+        with self.lock:
+            self._last_started_obs_id = obs_id
+
+    def is_session_halted(self, obs_id) -> bool:
+        """Чи саме ця сесія OBS заглушена (для точкового stop_streaming при register_source)."""
+        with self.lock:
+            return bool(obs_id) and obs_id == self._last_halted_obs_id
+
+    def _is_current_session_halted(self) -> bool:
+        # Під Manager.lock. Латч активний, поки остання відома сесія OBS
+        # збігається із заглушеною.
+        return self._last_halted_obs_id is not None and self._last_started_obs_id == self._last_halted_obs_id
+
+    def on_obs_streaming_started(self) -> None:
+        logging.info("OBS reports streaming started (obs-source.html)")
+
+    def on_mediamtx_connect_timeout(self) -> None:
+        """
+        MediaMTX закрив з'єднання OBS по readTimeout, так і не дочекавшись
+        публікації. `readTimeout` глобальний -- атрибутувати таймаут
+        конкретному пайплайну з логу не можна (лог має лише conn IP:port,
+        не шлях), тож лишаємо це глобальним попередженням.
+        """
+        with self.lock:
+            if self._any_pipeline_active():
+                return
+            now = time.monotonic()
+            if now - self._last_connect_timeout_toast_at < CONNECT_TIMEOUT_TOAST_COOLDOWN_SEC:
+                return
+            self._last_connect_timeout_toast_at = now
+        logging.warning(
+            "OBS failed to finish connecting to MediaMTX within the connect timeout -- "
+            "consider raising it in Settings"
+        )
+        self._emit_event(
+            "warning",
+            "OBS didn't finish connecting in time -- try raising the connect timeout in Settings",
+        )
+
+    def _any_pipeline_active(self) -> bool:
+        for p in self.pipelines.values():
+            if p.state != STATE_OFFLINE:
+                return True
+        return False
+
+    def _request_stop_streaming_in_obs(self) -> None:
+        logging.info(
+            "sending stop_streaming control to any connected obs-source.html "
+            "(requires its Page permission set to \"Full access to OBS\" to take effect)"
+        )
+        if self.on_control is not None:
+            self.on_control("stop_streaming")
+
+    # --- CRUD виходів (роутинг у пайплайн + персист на рівні менеджера) ---
+
+    def enable_output(self, name: str, pipeline: str | None = None) -> None:
+        with self.lock:
+            p = self._resolve_pipeline(pipeline)
+            if p is None:
+                return
+            p.enable_destination(name)
+            self._persist_locked()
+
+    def disable_output(self, name: str, pipeline: str | None = None) -> None:
+        with self.lock:
+            p = self._resolve_pipeline(pipeline)
+            if p is None:
+                return
+            p.disable_destination(name)
+            self._persist_locked()
+
+    def add_output(self, name: str, server: str, key: str, pipeline: str | None = None) -> None:
+        with self.lock:
+            p = self._resolve_pipeline(pipeline)
+            if p is None:
+                return
+            p.add_destination(name, server, key)
+            self._persist_locked()
+
+    def update_output(self, name: str, new_name: str, server: str, key: str, pipeline: str | None = None) -> None:
+        with self.lock:
+            p = self._resolve_pipeline(pipeline)
+            if p is None:
+                return
+            p.update_destination(name, new_name, server, key)
+            self._persist_locked()
+
+    def remove_output(self, name: str, pipeline: str | None = None) -> None:
+        with self.lock:
+            p = self._resolve_pipeline(pipeline)
+            if p is None:
+                return
+            p.remove_destination(name)
+            self._persist_locked()
+
+    def _resolve_pipeline(self, name: str | None) -> Pipeline | None:
+        if name is None:
+            return self._default_pipeline()
+        return self.pipelines.get(name)
+
+    def outputs_for_settings(self, pipeline: str | None = None) -> list[dict]:
+        with self.lock:
+            p = self._resolve_pipeline(pipeline)
+            return p.outputs_for_settings() if p else []
+
+    def output_names(self, pipeline: str | None = None) -> list[str]:
+        with self.lock:
+            p = self._resolve_pipeline(pipeline)
+            return p.destination_names() if p else []
+
+    # --- CRUD пайплайнів (немедленно + персист, БЕЗ рестарту MediaMTX --
+    # шляхи пре-провизионені §5.1). Валідацію робить викликач (http_server
+    # -> settings_store.validate_pipeline). ---
+
+    def add_pipeline(self, name: str, backup_file: str) -> None:
+        with self.lock:
+            if name in self.pipelines:
+                return
+            live_path = self._assign_path(name)  # авто-призначення (без комбобокса)
+            pcfg = {
+                "name": name, "is_default": False, "enabled": False,
+                "live_path": live_path, "backup_file": backup_file,
+                # Плейсхолдер-primary (обов'язковий інваріант пайплайна) --
+                # вимкнений і порожній; користувач заповнить у модалці площадки.
+                "primary_name": "primary", "primary_server": "", "primary_key": "",
+                "primary_enabled": False, "restreams": [],
+            }
+            self._instantiate_pipeline(pcfg)
+            logging.info("added pipeline %s on auto-assigned path %s", name, live_path)
+            self._persist_locked()
+
+    def _assign_path(self, name: str) -> str:
+        # Дружній slug з імені -> live/<slug>; гарантуємо унікальність
+        # (не збігтись із зайнятим шляхом, зокрема з дефолтним live/main).
+        # Шлях фіксується при створенні й НЕ міняється при перейменуванні
+        # (щоб не ламати вже налаштований OBS-вихід). Charset збігається з
+        # regex у mediamtx.yml (`[A-Za-z0-9_-]+`).
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-").lower() or "pipeline"
+        candidate = f"live/{slug}"
+        i = 2
+        while candidate in self._by_path:
+            candidate = f"live/{slug}-{i}"
+            i += 1
+        return candidate
+
+    def update_pipeline(self, name: str, new_name: str, backup_file: str) -> None:
+        with self.lock:
+            old = self.pipelines.get(name)
+            if old is None:
+                return
+            # Шлях (live_path) СТАБІЛЬНИЙ -- при перейменуванні не міняється
+            # (інакше зламався б уже налаштований OBS-вихід). Rename ->
+            # чисте перестворення (імена процесів/логів тегуються іменем),
+            # шлях і площадки переносимо через to_config().
+            if new_name != name:
+                new_pcfg = old.to_config()
+                new_pcfg["name"] = new_name
+                new_pcfg["backup_file"] = backup_file
+                old.shutdown()
+                self.pipelines.pop(name, None)
+                self._by_path.pop(old.live_path, None)
+                self._instantiate_pipeline(new_pcfg)
+                logging.info("recreated pipeline %s -> %s (path %s kept)", name, new_name, old.live_path)
+            else:
+                old.apply_local_settings(backup_file=backup_file)
+                logging.info("updated pipeline %s (backup)", name)
+            self._persist_locked()
+
+    def remove_pipeline(self, name: str) -> None:
+        with self.lock:
+            p = self.pipelines.get(name)
+            if p is None or p.is_default:
+                return  # дефолтний незнищенний
+            p.shutdown()
+            self.pipelines.pop(name, None)
+            self._by_path.pop(p.live_path, None)
+            logging.info("removed pipeline %s", name)
+            self._persist_locked()
+
+    def enable_pipeline(self, name: str) -> None:
+        # Master AND-гейт (тумблер у шапці Control), НЕ керування життєвим
+        # циклом: пайплайн і далі йде за публікацією OBS. ON -> піднімаємо
+        # площадки з власною галочкою (якщо ефір уже активний).
+        with self.lock:
+            p = self.pipelines.get(name)
+            if p is None:
+                return
+            p.set_master(True)
+            self._persist_locked()
+
+    def disable_pipeline(self, name: str) -> None:
+        # Master-гейт OFF -> глушимо ВСІ площадки цього пайплайна (relay/стан
+        # лишаються, пайплайн просто нікуди не віддає). Діє й на дефолтний.
+        with self.lock:
+            p = self.pipelines.get(name)
+            if p is None:
+                return
+            p.set_master(False)
+            self._persist_locked()
+
+    # --- аксессори для валідації/Settings ---
+
+    def pipeline_names(self) -> list[str]:
+        with self.lock:
+            return list(self.pipelines.keys())
+
+    def _ingest_key(self, live_path: str) -> str:
+        # Готовий OBS Stream Key для цього пайплайна: "<sub>?user=obs&pass=
+        # <obspass>", де sub -- шлях без префікса "live/". Порожній, якщо
+        # obs-пароль не вдалось прочитати з mediamtx.yml.
+        if not self._obs_ingest_pass:
+            return ""
+        sub = live_path[len("live/"):] if live_path.startswith("live/") else live_path
+        return f"{sub}?user=obs&pass={self._obs_ingest_pass}"
+
+    def _ordered_pipelines(self) -> list:
+        # Canonical display order -- default pipeline first, the rest keep
+        # their existing order (stable sort). Both status() and
+        # pipelines_for_settings() use it so the dashboard lists pipelines
+        # identically in the Control and Settings tabs. Call under self.lock.
+        return sorted(self.pipelines.values(), key=lambda p: not p.is_default)
+
+    def pipelines_for_settings(self) -> list[dict]:
+        with self.lock:
+            pipelines = self._ordered_pipelines()
+        server = f"rtmp://{self._public_host}:{self._rtmp_port}/live" if self._public_host else ""
+        # outputs_for_settings кожного пайплайна бере власний lock окремо.
+        result = [
+            {
+                "name": p.name,
+                "is_default": p.is_default,
+                "enabled": p.enabled,
+                "live_path": p.live_path,
+                "backup_file": p.pcfg.get("backup_file", ""),
+                # Готова інфа для налаштування OBS-виходу (замість комбобокса
+                # шляхів): куди публікувати цей пайплайн.
+                "ingest_server": server,
+                "ingest_key": self._ingest_key(p.live_path),
+                "platforms": p.outputs_for_settings(),
+            }
+            for p in pipelines
+        ]
+        return result  # вже впорядковано (_ordered_pipelines: дефолтний першим)
+
+    # --- глобальні System-налаштування ---
+
+    def apply_settings(self, values: dict) -> None:
+        """
+        Глобальний System-блок вкладки Settings: `connect_timeout_ms`,
+        `read_timeout_ms` (обидва -> `readTimeout` MediaMTX, один на
+        інстанс), `offline_timeout_sec` (один OBS -> одне вікно очікування;
+        веде дефолтний пайплайн, гасить усі), `icmp_ping`. Per-pipeline
+        `backup_file`/бітрейти -- через CRUD пайплайна (`update_pipeline`).
+        Тайминги MediaMTX застосовує викликач окремо (mediamtx_control).
+        Викликати без self.lock -- бере сам.
+        """
+        with self.lock:
+            self.config["connect_timeout_ms"] = int(values["connect_timeout_ms"])
+            self.config["read_timeout_ms"] = int(values["read_timeout_ms"])
+            self.config["offline_timeout_sec"] = int(values["offline_timeout_sec"])
+            self.config["icmp_ping"] = bool(values.get("icmp_ping", False))
+            self._persist_locked()
+
+    def on_offline_timeout(self) -> None:
+        """
+        Дефолтний пайплайн вичерпав offline-таймер (OBS не повернувся) ->
+        кінець усієї сесії: гасимо ВСІ пайплайни. Викликається з Timer-
+        потоку дефолтного пайплайна ПОЗА його локом -> тут беремо свій
+        Manager.lock і локи пайплайнів по черзі (коректний порядок).
+        """
+        with self.lock:
+            for pipeline in self.pipelines.values():
+                pipeline.halt()
+        self._emit_event("warning", "Broadcast ended -- OBS did not reconnect in time")
+
+    # --- статус / персист / життєвий цикл ---
+
+    def status(self) -> dict:
+        with self.lock:
+            pipelines = self._ordered_pipelines()
+            manual_halt = self._is_current_session_halted()
+        # status() кожного пайплайна бере власний lock окремо (взяв/
+        # відпустив) -- НЕ вкладено з Manager.lock і не з hub-локом
+        # (hub будує snapshot поза своїм локом).
+        return {
+            "pipelines": [p.status() for p in pipelines],
+            "manual_halt": manual_halt,
+        }
+
+    def _persist_locked(self) -> None:
+        # Під Manager.lock. to_config() кожного пайплайна бере власний
+        # lock (Manager->Pipeline, коректний порядок).
+        self.config["pipelines"] = [p.to_config() for p in self.pipelines.values()]
+        for key in _FLAT_PIPELINE_KEYS:
+            self.config.pop(key, None)
+        try:
+            settings_store.persist(self.config_path, self.config)
+        except OSError:
+            logging.exception("failed to persist config.json")
+
+    def _notify(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+    def _emit_event(self, level: str, text: str) -> None:
+        if self.on_event is not None:
+            self.on_event(level, text)
+
+    def emit_pipeline_event(self, pipeline: Pipeline, level: str, text: str) -> None:
+        # Дефолтний пайплайн -- без префікса (той самий текст, що й у
+        # одношляховій конфігурації); доп-пайплайни тегуються іменем.
+        if pipeline.is_default:
+            self._emit_event(level, text)
+        else:
+            self._emit_event(level, f"[{pipeline.name}] {text}")
+
+    def shutdown(self) -> None:
+        with self.lock:
+            self._stopping.set()
+            for pipeline in self.pipelines.values():
+                pipeline.shutdown()
 
     def _ping_loop(self):
         while not self._stopping.is_set():
             use_icmp = bool(self.config.get("icmp_ping", False))
-            for dest in list(self.destinations.values()):
-                if not dest.enabled:
-                    dest.rtt_ms = None
-                elif use_icmp:
-                    dest.rtt_ms = net_probe.icmp_rtt_ms(dest.url)
-                else:
-                    dest.rtt_ms = net_probe.tcp_rtt_ms(dest.url)
+            for pipeline in list(self.pipelines.values()):
+                pipeline_enabled = pipeline.enabled
+                for dest in pipeline.list_destinations():
+                    if not dest.enabled or not pipeline_enabled:
+                        dest.rtt_ms = None
+                    elif use_icmp:
+                        dest.rtt_ms = net_probe.icmp_rtt_ms(dest.url)
+                    else:
+                        dest.rtt_ms = net_probe.tcp_rtt_ms(dest.url)
             self._stopping.wait(PING_INTERVAL_SEC)

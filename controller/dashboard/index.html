@@ -25,16 +25,8 @@
 </header>
 
 <section id="tab-status" class="tab-panel">
-  <div id="obs-input" class="panel">
-    <h2>OBS input</h2>
-    <table id="obs-table">
-      <tbody>
-        <tr><th>Data</th><td id="obs-data">–</td></tr>
-        <tr><th>Video</th><td id="obs-video">–</td></tr>
-        <tr><th>Audio</th><td id="obs-audio">–</td></tr>
-      </tbody>
-    </table>
-  </div>
+  <!-- one OBS-input + badge panel per pipeline (rendered by JS) -->
+  <div id="status-pipelines"></div>
 
   <div id="components" class="panel">
     <h2>Components</h2>
@@ -48,8 +40,134 @@
 </section>
 
 <section id="tab-control" class="tab-panel" hidden>
+  <!-- one platform table per pipeline (rendered by JS) -->
+  <div id="control-pipelines"></div>
+</section>
+
+<section id="tab-settings" class="tab-panel" hidden>
   <div class="panel">
-    <table id="control-table">
+    <div class="panel-head">
+      <h2>Pipelines</h2>
+      <button type="button" id="btn-add-pipeline" class="ghost-button">+ Add pipeline</button>
+    </div>
+    <div id="pipelines-list"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">
+      <h2>System settings (global)</h2>
+      <button type="button" id="btn-apply" class="ghost-button">Apply</button>
+    </div>
+    <form id="settings-form">
+      <div class="field">
+        <label for="field-connect-timeout">Connect timeout (ms) -- wait for OBS's first frame (shared by all ingest paths)</label>
+        <input type="number" id="field-connect-timeout" name="connect_timeout_ms" min="2500" step="1">
+      </div>
+
+      <div class="field">
+        <label for="field-read-timeout">Read timeout (ms) -- react to a stalled network once live</label>
+        <input type="number" id="field-read-timeout" name="read_timeout_ms" min="300" step="1">
+      </div>
+
+      <div class="field">
+        <label for="field-offline-timeout">Offline timeout (seconds) -- wait for OBS to reconnect before ending the broadcast (all pipelines)</label>
+        <input type="number" id="field-offline-timeout" name="offline_timeout_sec" min="60" step="1">
+      </div>
+
+      <div class="field field-check">
+        <label for="field-icmp-ping"><input type="checkbox" id="field-icmp-ping" name="icmp_ping"> Use ICMP ping for the Control tab (off = TCP-connect time; ICMP may be blocked/need privileges)</label>
+      </div>
+
+      <div id="settings-errors" class="errors" hidden></div>
+    </form>
+  </div>
+</section>
+
+<!-- add/modify PLATFORM modal (scoped to a pipeline) -->
+<div id="platform-modal" class="modal-overlay" hidden>
+  <div class="modal">
+    <h2 id="platform-modal-title">Add platform</h2>
+    <div class="field">
+      <label for="modal-name">Name</label>
+      <input type="text" id="modal-name" placeholder="e.g. Kick" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <div class="masked-grid">
+        <label class="masked-grid-label" for="modal-server">Server</label>
+        <input type="password" id="modal-server" placeholder="rtmp://… or rtmps://…" autocomplete="off" spellcheck="false">
+        <button type="button" id="modal-secrets-show" class="reveal-toggle masked-grid-toggle">Show</button>
+        <label class="masked-grid-label" for="modal-key">Stream Key</label>
+        <input type="password" id="modal-key" placeholder="your stream key" autocomplete="off" spellcheck="false">
+        <label class="masked-grid-label">Final URL</label>
+        <div id="modal-preview" class="preview masked-grid-full">–</div>
+      </div>
+    </div>
+    <div id="modal-errors" class="errors" hidden></div>
+    <div class="actions">
+      <button type="button" id="modal-cancel">Cancel</button>
+      <button type="button" id="modal-ok" class="primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- add/modify PIPELINE modal -->
+<div id="pipeline-modal" class="modal-overlay" hidden>
+  <div class="modal">
+    <h2 id="pipeline-modal-title">Add pipeline</h2>
+    <div class="field">
+      <label for="pmodal-name">Name</label>
+      <input type="text" id="pmodal-name" placeholder="e.g. clean" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="pmodal-backup">Backup video path (on the VPS) -- may be shared with another pipeline</label>
+      <input type="text" id="pmodal-backup" placeholder="/path/to/backup.mp4" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field" id="pmodal-ingest-field" hidden>
+      <label>OBS output for this pipeline</label>
+      <div class="masked-grid">
+        <span class="masked-grid-label">Server</span>
+        <div class="preview" id="pmodal-ingest-server">–</div>
+        <button type="button" id="pmodal-ingest-show" class="reveal-toggle masked-grid-toggle">Show</button>
+        <span class="masked-grid-label">Stream Key</span>
+        <div class="preview" id="pmodal-ingest-key">–</div>
+      </div>
+    </div>
+    <div id="pmodal-errors" class="errors" hidden></div>
+    <div class="actions">
+      <button type="button" id="pmodal-cancel">Cancel</button>
+      <button type="button" id="pmodal-ok" class="primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- one pipeline block in the Status tab -->
+<template id="pipeline-status-template">
+  <div class="panel pipeline-panel">
+    <div class="pipeline-head">
+      <h2 class="pipeline-title"></h2>
+      <span class="pill pl-badge"></span>
+    </div>
+    <table class="obs-table">
+      <tbody>
+        <tr><th>OBS input</th><td class="obs-data">–</td></tr>
+        <tr><th>Video</th><td class="obs-video">–</td></tr>
+        <tr><th>Audio</th><td class="obs-audio">–</td></tr>
+      </tbody>
+    </table>
+  </div>
+</template>
+
+<!-- one pipeline block in the Control tab -->
+<template id="pipeline-control-template">
+  <div class="panel pipeline-panel">
+    <div class="pipeline-head">
+      <label class="pipeline-toggle-wrap">
+        <input type="checkbox" class="pipeline-toggle" title="Master switch for this pipeline's platforms — unchecking mutes all of them at once (each platform still keeps its own checkbox)">
+        <h2 class="pipeline-title"></h2>
+      </label>
+      <span class="pill pl-badge"></span>
+    </div>
+    <table class="control-table">
       <thead>
         <tr>
           <th>Platform</th>
@@ -62,86 +180,30 @@
       <tbody></tbody>
     </table>
   </div>
-</section>
+</template>
 
-<section id="tab-settings" class="tab-panel" hidden>
-  <div class="panel">
-    <h2>Platforms</h2>
-    <div id="platforms-list"></div>
-    <button type="button" id="btn-add-platform" class="ghost-button">+ Add platform</button>
+<!-- one pipeline block in the Settings tab -->
+<template id="settings-pipeline-template">
+  <div class="panel pipeline-panel">
+    <div class="pipeline-head">
+      <h2 class="pipeline-title"></h2>
+      <div class="pipeline-head-actions">
+        <button type="button" class="pl-delete icon-button" title="Delete pipeline">Delete</button>
+        <button type="button" class="pl-modify icon-button" title="Modify pipeline">Modify</button>
+      </div>
+    </div>
+    <div class="platforms-list"></div>
+    <button type="button" class="pl-add-platform ghost-button">+ Add platform</button>
   </div>
-
-  <div class="panel">
-    <h2>System settings</h2>
-    <form id="settings-form">
-      <div class="field">
-        <label for="field-backup">Backup video path (on the VPS)</label>
-        <input type="text" id="field-backup" name="backup_file" autocomplete="off" spellcheck="false">
-      </div>
-
-      <div class="field">
-        <label for="field-connect-timeout">Connect timeout (ms) -- wait for OBS's first frame</label>
-        <input type="number" id="field-connect-timeout" name="connect_timeout_ms" min="2500" step="1">
-      </div>
-
-      <div class="field">
-        <label for="field-read-timeout">Read timeout (ms) -- react to a stalled network once live</label>
-        <input type="number" id="field-read-timeout" name="read_timeout_ms" min="300" step="1">
-      </div>
-
-      <div class="field">
-        <label for="field-offline-timeout">Offline timeout (seconds)</label>
-        <input type="number" id="field-offline-timeout" name="offline_timeout_sec" min="60" step="1">
-      </div>
-
-      <div class="field field-check">
-        <label for="field-icmp-ping"><input type="checkbox" id="field-icmp-ping" name="icmp_ping"> Use ICMP ping for the Control tab (off = TCP-connect time; ICMP may be blocked/need privileges)</label>
-      </div>
-
-      <div id="settings-errors" class="errors" hidden></div>
-
-      <div class="actions">
-        <button type="button" id="btn-apply" class="primary">Apply</button>
-      </div>
-      <p class="hint">Backup path and offline timeout apply without interrupting. Changing the connect/read timeouts restarts MediaMTX and ends the current broadcast (you'll be asked to confirm).</p>
-    </form>
-  </div>
-</section>
-
-<div id="platform-modal" class="modal-overlay" hidden>
-  <div class="modal">
-    <h2 id="platform-modal-title">Add platform</h2>
-    <div class="field">
-      <label for="modal-name">Name</label>
-      <input type="text" id="modal-name" placeholder="e.g. Kick" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="field">
-      <label for="modal-server">Server URL (the platform's ingest URL)</label>
-      <input type="text" id="modal-server" placeholder="rtmp://… or rtmps://…" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="field">
-      <label for="modal-key">Stream key</label>
-      <input type="text" id="modal-key" placeholder="your stream key" autocomplete="off" spellcheck="false">
-    </div>
-    <div class="field">
-      <label>Final push URL (built automatically)</label>
-      <div id="modal-preview" class="preview">–</div>
-    </div>
-    <div id="modal-errors" class="errors" hidden></div>
-    <div class="actions">
-      <button type="button" id="modal-cancel">Cancel</button>
-      <button type="button" id="modal-ok" class="primary">OK</button>
-    </div>
-  </div>
-</div>
+</template>
 
 <template id="platform-row-template">
   <div class="platform-row">
     <span class="platform-name"></span>
-    <span class="platform-url"></span>
-    <button type="button" class="pf-show icon-button" title="Show / hide URL">Show</button>
-    <button type="button" class="pf-edit icon-button" title="Modify">Modify</button>
-    <button type="button" class="pf-delete icon-button" title="Delete">Delete</button>
+    <div class="platform-actions">
+      <button type="button" class="pf-delete icon-button" title="Delete">Delete</button>
+      <button type="button" class="pf-edit icon-button" title="Modify">Modify</button>
+    </div>
   </div>
 </template>
 

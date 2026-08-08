@@ -1,61 +1,46 @@
 """
 Керування MediaMTX-процесом з боку контролера -- потрібне ЛИШЕ для
-Settings -> Apply & Restart у дашборді (значення `connect_timeout_ms`/
-`read_timeout_ms` живуть у `controller/config.json`, а MediaMTX читає
-свій власний `readTimeout` з окремого `mediamtx.yml`, який ніхто,
-крім `restreamctl.sh`/цього модуля, не перезаписує). Ручний шлях через
-SSH (`restreamctl.sh start`/`restart`) лишається за `restreamctl.sh` --
+Settings -> Apply & Restart у дашборді. `data/mediamtx.yml` -- це
+згенерований артефакт: перед рестартом рендеримо його наново з
+`controller/mediamtx.yml.template` + `data/config.json` (єдине джерело
+правди для паролів і таймаутів, варіант Б; той самий рендер, що робить
+`restreamctl.sh` через `mediamtx_config.py`). Ручний шлях через SSH
+(`restreamctl.sh start`/`restart`) лишається за `restreamctl.sh` --
 цей модуль його не замінює.
 """
 
 import logging
 import os
-import re
 import signal
 import subprocess
 import time
 from pathlib import Path
 
-_READ_TIMEOUT_LINE = re.compile(r"^readTimeout:[ \t]*\S+[ \t]*$", re.MULTILINE)
+import mediamtx_config
 
 _STOP_TIMEOUT_SEC = 5.0
 _STARTUP_CHECK_DELAY_SEC = 1.0
 
 
-def sync_read_timeout(mediamtx_yml_path: Path, connect_timeout_ms: int, read_timeout_ms: int) -> None:
-    """
-    Підміняє значення `readTimeout:` у вже наявному `mediamtx.yml` на
-    суму `connect_timeout_ms + read_timeout_ms` -- звичайним текстовим
-    заміщенням рядка (проєкт свідомо уникає `PyYAML`, той самий
-    принцип, що й для `controller/config.json`). Захисно: якщо рядок
-    не знайдено -- кидає виняток і НІЧОГО не пише, краще голосно
-    зупинити рестарт, ніж мовчки лишити файл без зміни чи зіпсованим.
-    """
-    text = mediamtx_yml_path.read_text(encoding="utf-8")
-    total_ms = connect_timeout_ms + read_timeout_ms
-    new_text, count = _READ_TIMEOUT_LINE.subn(f"readTimeout: {total_ms}ms", text, count=1)
-    if count == 0:
-        raise RuntimeError(f"'readTimeout:' line not found in {mediamtx_yml_path} -- refusing to touch the file")
-
-    tmp_path = mediamtx_yml_path.with_suffix(".tmp" + mediamtx_yml_path.suffix)
-    tmp_path.write_text(new_text, encoding="utf-8")
-    tmp_path.replace(mediamtx_yml_path)
-
-
-def restart_mediamtx(base_dir: Path) -> None:
+def restart_mediamtx(base_dir: Path, config: dict) -> None:
     """
     Той самий макет каталогів, що й `restreamctl.sh` (`bin/mediamtx`,
-    `mediamtx.yml`, `mediamtx.log`, `.mediamtx.pid` у корені проєкту) --
+    `data/mediamtx.yml`, `logs/mediamtx.log`, `data/.mediamtx.pid`) --
     щоб `restreamctl.sh status`/`stop` лишались коректними незалежно
-    від того, хто останній рестартнув MediaMTX.
+    від того, хто останній рестартнув MediaMTX. `data/mediamtx.yml`
+    рендериться заново з config перед стартом.
     """
-    pid_file = base_dir / ".mediamtx.pid"
+    data_dir = base_dir / "data"
+    mediamtx_yml = data_dir / "mediamtx.yml"
+    mediamtx_config.render(base_dir / "controller" / "mediamtx.yml.template", config, mediamtx_yml)
+    pid_file = data_dir / ".mediamtx.pid"
     _stop_existing(pid_file)
     _start_new(
         pid_file,
         mediamtx_bin=base_dir / "bin" / "mediamtx",
-        mediamtx_yml=base_dir / "mediamtx.yml",
-        log_path=base_dir / "mediamtx.log",
+        mediamtx_yml=mediamtx_yml,
+        log_path=base_dir / "logs" / "mediamtx.log",
+        cwd=data_dir,
     )
 
 
@@ -83,13 +68,15 @@ def _stop_existing(pid_file: Path) -> None:
         pass
 
 
-def _start_new(pid_file: Path, mediamtx_bin: Path, mediamtx_yml: Path, log_path: Path) -> None:
+def _start_new(pid_file: Path, mediamtx_bin: Path, mediamtx_yml: Path, log_path: Path, cwd: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab") as log_file:
         proc = subprocess.Popen(
             [str(mediamtx_bin), str(mediamtx_yml)],
             stdout=log_file,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
+            cwd=str(cwd),  # будь-які відносні артефакти MediaMTX (auto.crt/key) -> data/
             start_new_session=True,  # інакше наступний os.execv() контролера міг би зачепити цей процес
         )
     pid_file.write_text(str(proc.pid), encoding="ascii")
