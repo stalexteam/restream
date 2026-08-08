@@ -214,6 +214,38 @@ class BackupPreparer:
                 "check/preparation for this stream start"
             )
             return
+        self._build_for_live(live)
+
+    def prepare_async_remux(self, video_probe_url: str, audio_probe_url: str) -> None:
+        """
+        Remux-варіант (§5.1 #5): backup у FALLBACK грає як ЄДИНЕ джерело, і
+        на стику backup<->live його seq-headers мусять збігтися з живими --
+        а живі тут із ДВОХ джерел. Тож відео-геометрію нормалізуємо під
+        video_src, а аудіо-параметри (кодек/канали/samplerate) -- під
+        audio_src (інакше стик дав би розбіжність аудіо -> decode-глюк).
+        """
+        threading.Thread(
+            target=self._prepare_remux, args=(video_probe_url, audio_probe_url), daemon=True).start()
+
+    def _prepare_remux(self, video_probe_url: str, audio_probe_url: str) -> None:
+        vlive = probe_stream_params(video_probe_url)
+        alive = probe_stream_params(audio_probe_url)
+        if vlive is None or alive is None:
+            logging.warning(
+                "remux: could not determine video/audio source parameters -- "
+                "skipping backup check/preparation for this stream start"
+            )
+            return
+        # Відео-поля з video_src, аудіо-поля з audio_src.
+        live = {
+            "video_codec": vlive["video_codec"], "width": vlive["width"],
+            "height": vlive["height"], "fps": vlive["fps"],
+            "audio_codec": alive["audio_codec"], "channels": alive["channels"],
+            "sample_rate": alive["sample_rate"],
+        }
+        self._build_for_live(live)
+
+    def _build_for_live(self, live: dict) -> None:
         self._last_live_params = live
 
         source_params = probe_stream_params(str(self._source))

@@ -109,6 +109,67 @@ def validate_pipeline(name: str, backup_file: str, existing_names, base_dir: Pat
     return errors
 
 
+def validate_pipeline_name(name: str, existing_names) -> dict[str, str]:
+    """
+    Валідація ЛИШЕ імені пайплайна (унікальне, непорожнє). Використовується
+    при СТВОРЕННІ будь-якого типу (потік «вибрати тип -> ввести імʼя ->
+    створити -> редагувати»): решта полів задається вже у віджеті
+    редагування, тому на створенні перевіряємо тільки імʼя.
+    """
+    errors: dict[str, str] = {}
+    clean_name = (name or "").strip()
+    if not clean_name:
+        errors["name"] = "name is required"
+    elif clean_name in set(existing_names):
+        errors["name"] = f"a pipeline named '{clean_name}' already exists"
+    return errors
+
+
+# Back-compat-псевдонім: валідація input-пайплайна = лише імʼя.
+validate_input_pipeline = validate_pipeline_name
+
+
+def validate_remux_pipeline(name: str, video_src_path: str, audio_src_path: str,
+                            backup_file: str, existing_names, base_dir: Path,
+                            sources) -> dict[str, str]:
+    """
+    Валідація remux-пайплайна (plan.md §4.4). `sources` -- список
+    придатних джерел `{name, live_path, type}` (лише restream/input, тож
+    посилання на remux/самого себе неможливе за побудовою -> нема цепочек).
+    All-or-nothing. Backup обов'язковий (у remux є output-половина з backup).
+    """
+    errors: dict[str, str] = {}
+
+    clean_name = (name or "").strip()
+    if not clean_name:
+        errors["name"] = "name is required"
+    elif clean_name in set(existing_names):
+        errors["name"] = f"a pipeline named '{clean_name}' already exists"
+
+    if not isinstance(backup_file, str) or not backup_file:
+        errors["backup_file"] = "path is required"
+    else:
+        resolved = resolve_backup_path(backup_file, base_dir)
+        if not resolved.is_file():
+            errors["backup_file"] = f"file not found: {resolved}"
+        elif probe_stream_params(str(resolved)) is None:
+            errors["backup_file"] = "no readable video/audio track in this file (ffprobe failed)"
+
+    valid_paths = {s.get("live_path") for s in (sources or [])}
+    if not video_src_path:
+        errors["video_src_path"] = "video source is required"
+    elif video_src_path not in valid_paths:
+        errors["video_src_path"] = "unknown source pipeline"
+    if not audio_src_path:
+        errors["audio_src_path"] = "audio source is required"
+    elif audio_src_path not in valid_paths:
+        errors["audio_src_path"] = "unknown source pipeline"
+    if video_src_path and audio_src_path and video_src_path == audio_src_path:
+        errors["audio_src_path"] = "video and audio sources must be different"
+
+    return errors
+
+
 def persist(config_path: Path, config: dict) -> None:
     """
     Атомарний запис усього in-memory config назад у файл (тимчасовий

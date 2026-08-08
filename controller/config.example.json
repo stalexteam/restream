@@ -15,6 +15,7 @@
   "pipelines": [
     {
       "name": "main",
+      "type": "restream",
       "is_default": true,
       "enabled": true,
       "live_path": "live/main",
@@ -24,6 +25,28 @@
       "primary_key": "CHANGE_ME_STREAM_KEY",
       "primary_enabled": true,
       "restreams": []
+    },
+    {
+      "name": "clean",
+      "type": "input",
+      "is_default": false,
+      "enabled": true,
+      "live_path": "live/clean"
+    },
+    {
+      "name": "youtube",
+      "type": "remux",
+      "is_default": false,
+      "enabled": false,
+      "video_src_path": "live/main",
+      "audio_src_path": "live/clean",
+      "audio_trim_ms": 0,
+      "backup_file": "__BASE_DIR__/backup/backup.mp4",
+      "primary_name": "youtube",
+      "primary_server": "rtmp://a.rtmp.youtube.com/live2",
+      "primary_key": "CHANGE_ME_STREAM_KEY",
+      "primary_enabled": false,
+      "restreams": []
     }
   ],
 
@@ -31,6 +54,12 @@
   "connect_timeout_ms": 5000,
   "read_timeout_ms": 500,
   "icmp_ping": false,
+  "remux_reanchor": {
+    "enabled": true,
+    "ema_sec": 300,
+    "deadband_ms": 12,
+    "step_ms": 5
+  },
 
   "log_file": "__BASE_DIR__/controller/controller.log"
 }

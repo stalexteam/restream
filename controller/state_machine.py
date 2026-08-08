@@ -39,11 +39,22 @@ import settings_store
 from backup_prep import BackupCache, BackupPreparer
 from ffmpeg_proc import FfmpegProcess
 from flv import read_flv_tags
-from switcher import FLVSwitcher, OutputSink
+from probe import probe_stream_params
+from switcher import FLVSwitcher, MergeSwitcher, OutputSink
 
 STATE_OFFLINE = "OFFLINE"    # OBS не публікує, на платформи нічого не йде
 STATE_LIVE = "LIVE"          # живий відеопотік від OBS іде на платформи
 STATE_FALLBACK = "FALLBACK"  # OBS відвалився, на платформи крутиться заглушка
+
+# Типи пайплайнів (поле `type` у pcfg). `restream` -- класичний потік зі
+# своїм RTMP-входом і виходами (дефолт при відсутності поля, back-compat).
+# `input` -- лише іменований ingest-шлях без виходів (джерело для remux).
+# `remux` -- виходи + backup, але джерело — merge video з одного чужого
+# входу + audio з іншого (свого live_path немає). Див. plan.md §2.
+TYPE_RESTREAM = "restream"
+TYPE_INPUT = "input"
+TYPE_REMUX = "remux"
+_PIPELINE_TYPES = (TYPE_RESTREAM, TYPE_INPUT, TYPE_REMUX)
 
 # Таймаут запису destination -> платформа (мкс): скільки чекати зависле
 # з'єднання, перш ніж ffmpeg сам завершиться з помилкою.
@@ -92,6 +103,7 @@ def _pipeline_from_flat(config: dict) -> dict:
     primary_server = config.get("primary_server") or config.get("primary_url") or config.get("twitch_url", "")
     return {
         "name": "main",
+        "type": TYPE_RESTREAM,
         "is_default": True,
         "enabled": True,
         "live_path": config.get("live_path", "live/main"),
@@ -116,6 +128,11 @@ def normalize_pipelines(config: dict) -> list[dict]:
     pipelines = [p for p in raw if isinstance(p, dict) and p.get("name")]
     if not pipelines:
         return [_pipeline_from_flat(config)]
+    for p in pipelines:
+        # Відсутнє/невідоме `type` -> restream (back-compat зі старим
+        # конфігом без поля типу). Дефолтний завжди restream (у нього є вхід).
+        if p.get("type") not in _PIPELINE_TYPES:
+            p["type"] = TYPE_RESTREAM
     if not any(p.get("is_default") for p in pipelines):
         pipelines[0]["is_default"] = True
     return pipelines
@@ -187,30 +204,13 @@ class Pipeline:
     глобальних налаштувань підхоплюється без перестворення пайплайна.
     """
 
+    PIPELINE_TYPE = TYPE_RESTREAM
+
     def __init__(self, manager, pcfg: dict, global_config: dict, base_dir: Path, log_dir: Path):
-        self._manager = manager
-        self.pcfg = pcfg
-        self._gcfg = global_config
-        self.base_dir = base_dir
-        self.log_dir = log_dir
+        self._init_common(manager, pcfg, global_config, base_dir, log_dir)
 
-        self.name = pcfg["name"]
-        self.is_default = bool(pcfg.get("is_default", False))
-        self.enabled = bool(pcfg.get("enabled", True))
+        # --- source-половина: один relay на власному live_path ---
         self.live_path = pcfg["live_path"]
-
-        self.lock = threading.RLock()
-        self.state = STATE_OFFLINE
-        self._state_since = time.time()
-        self._timeout_timer: threading.Timer | None = None
-        self._fallback_deadline: float | None = None
-        # Оракул: відкладена перепроверка "чи це був штатний стоп" (§7).
-        self._oracle_timer: threading.Timer | None = None
-        self._last_flapping_toast_at = 0.0
-        # OFFLINE через помилку (жодна площадка не досяжна), а не через
-        # свідомий стоп/таймаут -- дашборд показує окремий "Failure" бейдж.
-        self._halted = False
-
         mtx_host = global_config["mediamtx_rtmp_host"]
         mtx_port = global_config["mediamtx_rtmp_port"]
         user = global_config["internal_user"]
@@ -221,13 +221,6 @@ class Pipeline:
         live_url = f"rtmp://{mtx_host}:{mtx_port}/{self.live_path}?user={user}&pass={password}"
         self.live_url = live_url
         self._live_probe_url = live_url
-
-        self.switcher = FLVSwitcher()
-        backup_source = settings_store.resolve_backup_path(pcfg.get("backup_file", ""), base_dir)
-        # Цільовий бітрейт заглушки автодетектиться з ВИМІРЯНОГО бітрейту
-        # живого потоку (switcher.source_stats) -- ручного вводу немає.
-        self._backup_preparer = BackupPreparer(
-            backup_source, pcfg, manager._backup_cache, self.switcher.source_stats)
 
         tag = _safe_proc_name(self.name)
         self.relay = FfmpegProcess(
@@ -243,6 +236,43 @@ class Pipeline:
             on_start=self._make_reader_hook("relay"),
         )
 
+    def _init_common(self, manager, pcfg: dict, global_config: dict, base_dir: Path, log_dir: Path) -> None:
+        """
+        Спільна output-половина будь-якого пайплайна з виходами
+        (restream + remux): стан/локи/switcher/backup/destinations. НЕ
+        чіпає source-половину (relay для restream, два relay+merge для
+        remux) -- її кожен тип будує сам після цього виклику.
+        """
+        self._manager = manager
+        self.pcfg = pcfg
+        self._gcfg = global_config
+        self.base_dir = base_dir
+        self.log_dir = log_dir
+
+        self.name = pcfg["name"]
+        self.is_default = bool(pcfg.get("is_default", False))
+        self.enabled = bool(pcfg.get("enabled", True))
+
+        self.lock = threading.RLock()
+        self.state = STATE_OFFLINE
+        self._state_since = time.time()
+        self._timeout_timer: threading.Timer | None = None
+        self._fallback_deadline: float | None = None
+        # Оракул: відкладена перепроверка "чи це був штатний стоп" (§7).
+        self._oracle_timer: threading.Timer | None = None
+        self._last_flapping_toast_at = 0.0
+        # OFFLINE через помилку (жодна площадка не досяжна), а не через
+        # свідомий стоп/таймаут -- дашборд показує окремий "Failure" бейдж.
+        self._halted = False
+
+        self.switcher = self._make_switcher()
+        backup_source = settings_store.resolve_backup_path(pcfg.get("backup_file", ""), base_dir)
+        # Цільовий бітрейт заглушки автодетектиться з ВИМІРЯНОГО бітрейту
+        # живого потоку (switcher.source_stats) -- ручного вводу немає.
+        self._backup_preparer = BackupPreparer(
+            backup_source, pcfg, manager._backup_cache, self.switcher.source_stats)
+
+        tag = _safe_proc_name(self.name)
         self.backup = FfmpegProcess(
             f"backup-{tag}",
             lambda: [
@@ -284,6 +314,10 @@ class Pipeline:
 
     def _notify(self) -> None:
         self._manager._notify()
+
+    def subscriptions(self) -> list[tuple[str, str]]:
+        """Хук-підписки (path, role) для роутингу MediaMTX (1:N). restream/input володіють своїм live_path."""
+        return [(self.live_path, "owner")]
 
     # --- обробники подій джерела (source). Латч перевіряє менеджер ПЕРЕД
     # делегуванням, тож тут його вже немає. ---
@@ -436,9 +470,17 @@ class Pipeline:
 
     # --- завершення (механічне, без OBS-впливу) ---
 
+    def _make_switcher(self):
+        """Фабрика switcher-а: restream -- FLVSwitcher; remux перевизначає на MergeSwitcher."""
+        return FLVSwitcher()
+
+    def _stop_sources(self) -> None:
+        """Зупинити source-половину (для restream -- relay; remux перевизначає на два relay). Під self.lock."""
+        self.relay.stop()
+
     def _teardown_clean(self) -> None:
         """Штатне чисте завершення (стоп vs обрив): усе стоп, стан OFFLINE, без заглушки/таймауту. Під self.lock."""
-        self.relay.stop()
+        self._stop_sources()
         self.backup.stop()
         self._stop_all_destinations()
         self._cancel_timeout()
@@ -596,6 +638,28 @@ class Pipeline:
 
     # --- статус / конфіг / життєвий цикл ---
 
+    def _destinations_status(self) -> list[dict]:
+        # Під self.lock. Спільний для restream і remux (успадковує).
+        dests = []
+        for dest in self.destinations.values():
+            stats = dest.sink.stats()
+            dests.append({
+                "name": dest.name,
+                "is_primary": dest.is_primary,
+                "enabled": dest.enabled,
+                "failed": dest.failed,
+                "running": dest.proc.is_running(),
+                "pid": dest.proc.pid(),
+                "up": dest.proc.ever_ran_long(),
+                "uptime_sec": round(dest.proc.uptime_sec()),
+                "restarts": dest.proc.restart_count(),
+                "rtt_ms": dest.rtt_ms,
+                "dropped": stats["dropped"],
+                "behind": stats["behind"],
+            })
+        dests.sort(key=lambda d: not d["is_primary"])  # primary завжди першим
+        return dests
+
     def status(self) -> dict:
         with self.lock:
             obs = self.switcher.source_stats()
@@ -604,27 +668,11 @@ class Pipeline:
                 for key in ("width", "height", "fps", "video_codec", "audio_codec"):
                     obs[key] = live.get(key)
 
-            dests = []
-            for dest in self.destinations.values():
-                stats = dest.sink.stats()
-                dests.append({
-                    "name": dest.name,
-                    "is_primary": dest.is_primary,
-                    "enabled": dest.enabled,
-                    "failed": dest.failed,
-                    "running": dest.proc.is_running(),
-                    "pid": dest.proc.pid(),
-                    "up": dest.proc.ever_ran_long(),
-                    "uptime_sec": round(dest.proc.uptime_sec()),
-                    "restarts": dest.proc.restart_count(),
-                    "rtt_ms": dest.rtt_ms,
-                    "dropped": stats["dropped"],
-                    "behind": stats["behind"],
-                })
-            dests.sort(key=lambda d: not d["is_primary"])  # primary завжди першим
+            dests = self._destinations_status()
 
             return {
                 "name": self.name,
+                "type": self.PIPELINE_TYPE,
                 "is_default": self.is_default,
                 "enabled": self.enabled,
                 "state": self.state,
@@ -644,6 +692,7 @@ class Pipeline:
             primary = self._primary_destination()
             return {
                 "name": self.name,
+                "type": self.PIPELINE_TYPE,
                 "is_default": self.is_default,
                 "enabled": self.enabled,
                 "live_path": self.live_path,
@@ -662,7 +711,7 @@ class Pipeline:
         with self.lock:
             self._cancel_timeout()
             self._cancel_oracle()
-            self.relay.stop()
+            self._stop_sources()
             self.backup.stop()
             for dest in self.destinations.values():
                 dest.proc.stop()
@@ -764,7 +813,7 @@ class Pipeline:
         (failsafe-асиметрія §8: OBS глушиться лише якщо це дефолтний
         пайплайн АБО померли всі). Викликати під self.lock.
         """
-        self.relay.stop()
+        self._stop_sources()
         self.backup.stop()
         self._stop_all_destinations()
         self._cancel_timeout()
@@ -862,6 +911,408 @@ class Pipeline:
                 self._teardown_clean()
 
 
+class RemuxPipeline(Pipeline):
+    """
+    Пайплайн-remux (plan.md §5.6): output-половина (destinations/backup/
+    стан/failsafe/оракул) успадкована від `Pipeline`, а source -- це
+    merge video з одного чужого входу + audio з іншого (свого live_path
+    немає). Continuity -- AND-gate по двох входах (§5.3): LIVE лише коли
+    обидва течуть, будь-який обрив -> FALLBACK (backup).
+
+    **Фаза 1: реального merge ще немає (MergeSwitcher -- Фаза 2).** Тут
+    лише стейт-машина за доступністю входів: обидва вгору -> LIVE (у
+    Фазі 2 сюди підключаться два relay + MergeSwitcher), будь-який вниз
+    -> backup. remux ніколи не default -> веде себе як aux (оракул,
+    таймер offline веде дефолтний).
+    """
+
+    PIPELINE_TYPE = TYPE_REMUX
+
+    def __init__(self, manager, pcfg: dict, global_config: dict, base_dir: Path, log_dir: Path):
+        self._init_common(manager, pcfg, global_config, base_dir, log_dir)
+        # source-половина: посилання на два чужі входи по live_path
+        # (стабільні при rename джерела), власного live_path у remux немає.
+        self.live_path = None
+        self.video_src_path = pcfg.get("video_src_path", "")
+        self.audio_src_path = pcfg.get("audio_src_path", "")
+        self.audio_trim_ms = int(pcfg.get("audio_trim_ms", 0) or 0)
+        # Готовність (хук available/unavailable) і стагнація (read-timeout)
+        # кожної ролі. "Тече" = ready AND not stalled.
+        self._src_ready: dict[str, bool] = {"video": False, "audio": False}
+        self._src_stalled: dict[str, bool] = {"video": False, "audio": False}
+
+        mtx_host = global_config["mediamtx_rtmp_host"]
+        mtx_port = global_config["mediamtx_rtmp_port"]
+        user = global_config["internal_user"]
+        password = global_config["internal_pass"]
+        self._video_probe_url = f"rtmp://{mtx_host}:{mtx_port}/{self.video_src_path}?user={user}&pass={password}"
+        self._audio_probe_url = f"rtmp://{mtx_host}:{mtx_port}/{self.audio_src_path}?user={user}&pass={password}"
+
+        tag = _safe_proc_name(self.name)
+        self._relays: dict[str, FfmpegProcess] = {
+            "video": self._make_source_relay(f"relay-{tag}-video", self._video_probe_url, "video"),
+            "audio": self._make_source_relay(f"relay-{tag}-audio", self._audio_probe_url, "audio"),
+        }
+
+    def _make_switcher(self):
+        return MergeSwitcher(
+            reanchor=self._gcfg.get("remux_reanchor"),
+            audio_trim_ms=int(self.pcfg.get("audio_trim_ms", 0) or 0),
+        )
+
+    def _make_source_relay(self, name: str, url: str, role: str) -> FfmpegProcess:
+        return FfmpegProcess(
+            name,
+            ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", url,
+             "-c", "copy", "-f", "flv", "pipe:1"],
+            self.log_dir,
+            capture_stdout=True,
+            on_start=self._make_source_reader(role),
+        )
+
+    def _make_source_reader(self, role: str):
+        def on_start(proc):
+            threading.Thread(
+                target=read_flv_tags,
+                args=(proc.stdout, role, self.switcher.process),
+                kwargs={
+                    "read_timeout_sec": self._gcfg["read_timeout_ms"] / 1000,
+                    "on_stall": lambda: self._on_source_stalled(role),
+                    "on_resume": lambda: self._on_source_resumed(role),
+                },
+                daemon=True,
+            ).start()
+        return on_start
+
+    def subscriptions(self) -> list[tuple[str, str]]:
+        subs = []
+        if self.video_src_path:
+            subs.append((self.video_src_path, "video"))
+        if self.audio_src_path:
+            subs.append((self.audio_src_path, "audio"))
+        return subs
+
+    def _stop_sources(self) -> None:
+        for relay in self._relays.values():
+            relay.stop()
+        self._src_ready = {"video": False, "audio": False}
+        self._src_stalled = {"video": False, "audio": False}
+
+    def _flowing(self, role: str) -> bool:
+        return self._src_ready.get(role, False) and not self._src_stalled.get(role, False)
+
+    def _both_flowing(self) -> bool:
+        return self._flowing("video") and self._flowing("audio")
+
+    # remux не володіє власним шляхом -- owner-хука в нього нема; життєвий
+    # цикл ведуть on_source_available/unavailable (роутинг Manager по ролі).
+    def on_available(self) -> None:
+        logging.warning("[%s] remux has no owner path -- on_available ignored", self.name)
+
+    def on_unavailable(self) -> None:
+        logging.warning("[%s] remux has no owner path -- on_unavailable ignored", self.name)
+
+    def on_source_available(self, role: str) -> None:
+        with self.lock:
+            if role in self._src_ready:
+                self._src_ready[role] = True
+                self._src_stalled[role] = False
+            relay = self._relays.get(role)
+            if relay is not None:
+                relay.start()
+            self._reconsider_up()
+
+    def on_source_unavailable(self, role: str) -> None:
+        with self.lock:
+            if role in self._src_ready:
+                self._src_ready[role] = False
+                self._src_stalled[role] = False
+            relay = self._relays.get(role)
+            if relay is not None:
+                relay.stop()
+            self._reconsider_down(role)
+
+    def _on_source_stalled(self, role: str) -> None:
+        # read-timeout на relay ролі: дані просіли (з'єднання може ще жити,
+        # relay НЕ зупиняємо -- як restream). Трактуємо як «вхід просів».
+        with self.lock:
+            self._src_stalled[role] = True
+            self._reconsider_down(role)
+
+    def _on_source_resumed(self, role: str) -> None:
+        with self.lock:
+            self._src_stalled[role] = False
+            self._reconsider_up()
+
+    def _reconsider_up(self) -> None:
+        # Під self.lock. Обидва входи течуть -> LIVE (cold-start з OFFLINE,
+        # безшовний повернення з FALLBACK). Merge живиться reader-потоками
+        # обох relay; тут лише перемикаємо активне джерело switcher-а.
+        if not self._both_flowing():
+            return
+        self._cancel_timeout()
+        self._cancel_oracle()
+        if self.state == STATE_LIVE:
+            return
+        if self.state == STATE_FALLBACK:
+            logging.info("[%s] both remux sources flowing again -> waiting for a live keyframe for a seamless switch", self.name)
+            self.switcher.request_switch("live", on_switched=self._on_switched_to_live)
+        else:  # OFFLINE
+            logging.info("[%s] both remux sources up -> starting the broadcast", self.name)
+            self._emit("info", "Broadcast started")
+            self._last_flapping_toast_at = 0.0
+            self._halted = False
+            self.backup.stop()
+            # Свіжа сесія -> чистий merge-стан (інакше протухлі last_out/offset
+            # з попередньої сесії ламають нове аудіо/затримку -- див. reset()).
+            self.switcher.reset()
+            self.switcher.set_active("live")
+            for dest in self._enabled_destinations():
+                self._start_destination(dest)
+            self._set_state(STATE_LIVE)
+        self._backup_preparer.prepare_async_remux(self._video_probe_url, self._audio_probe_url)
+
+    def _reconsider_down(self, role: str) -> None:
+        # Під self.lock. Якийсь вхід перестав текти -> AND-gate у backup.
+        if self.state == STATE_OFFLINE or self._both_flowing():
+            return
+        if self.state == STATE_FALLBACK:
+            return
+        # був LIVE. remux -- завжди aux: без живої головної сесії тушимо чисто.
+        if self._manager.is_graceful_recent() or not self._manager.is_main_session_live():
+            logging.info("[%s] remux %s source down with no live main session to lean on -> clean end (no backup)", self.name, role)
+            self._teardown_clean()
+            return
+        if self._enabled_destinations() and not self._any_enabled_destination_alive():
+            logging.error(
+                "[%s] remux %s source down, and no enabled platform was ever reached -- stopping this pipeline",
+                self.name, role,
+            )
+            self._give_up_on_unreachable()
+            return
+        logging.warning("[%s] remux %s source down -> switching to backup video (waiting on the default pipeline's timeout)", self.name, role)
+        self.switcher.set_active("backup")
+        self.backup.start()
+        self._schedule_oracle_recheck()
+        self._set_state(STATE_FALLBACK)
+
+    def _on_switched_to_live(self, params_changed: bool):
+        """Callback MergeSwitcher.request_switch (з reader-потоку). Робота -- в окремому потоці під self.lock (як Pipeline._on_switched_to_relay)."""
+        def _finish():
+            with self.lock:
+                if self.state != STATE_FALLBACK:
+                    return
+                if params_changed:
+                    logging.warning(
+                        "[%s] remux source parameters changed while down -> reconnecting all platforms cleanly",
+                        self.name,
+                    )
+                    self.switcher.set_active("live")
+                    for dest in self._enabled_destinations():
+                        if dest.failed:
+                            continue
+                        dest.proc.stop()
+                        dest.proc.start()
+                else:
+                    logging.info("[%s] remux live is ready (first keyframe) -> seamless switch, stopping the backup video", self.name)
+                self._set_state(STATE_LIVE)
+                self.backup.stop()
+        threading.Thread(target=_finish, daemon=True).start()
+
+    def set_audio_trim(self, ms: int) -> None:
+        """Ручний триммер аудіо (§5.2), live-apply: зсуває audio_offset у merge без реконнекту."""
+        with self.lock:
+            self.audio_trim_ms = int(ms)
+            self.pcfg["audio_trim_ms"] = int(ms)
+            self.switcher.set_audio_trim(int(ms))
+            logging.info("[%s] audio_trim_ms set to %s", self.name, ms)
+
+    def status(self) -> dict:
+        with self.lock:
+            return {
+                "name": self.name,
+                "type": self.PIPELINE_TYPE,
+                "is_default": self.is_default,
+                "enabled": self.enabled,
+                "state": self.state,
+                "state_since": self._state_since,
+                "halted": self._halted,
+                "obs": self.switcher.source_stats(),
+                "backup_running": self.backup.is_running(),
+                "backup_pid": self.backup.pid(),
+                "fallback_deadline": self._fallback_deadline,
+                "destinations": self._destinations_status(),
+                # remux-специфіка для дашборда: статус обох входів (тече = ready
+                # AND not stalled) + поточна оцінена A/V-Δ (skew).
+                "video_src_path": self.video_src_path,
+                "audio_src_path": self.audio_src_path,
+                "audio_trim_ms": self.audio_trim_ms,
+                "sources": {r: self._flowing(r) for r in ("video", "audio")},
+                "skew_ms": self.switcher.skew_ms(),
+            }
+
+    def to_config(self) -> dict:
+        with self.lock:
+            primary = self._primary_destination()
+            return {
+                "name": self.name,
+                "type": self.PIPELINE_TYPE,
+                "is_default": self.is_default,
+                "enabled": self.enabled,
+                "video_src_path": self.video_src_path,
+                "audio_src_path": self.audio_src_path,
+                "audio_trim_ms": self.audio_trim_ms,
+                "backup_file": self.pcfg.get("backup_file", ""),
+                "primary_name": primary.name,
+                "primary_server": primary.server,
+                "primary_key": primary.key,
+                "primary_enabled": primary.enabled,
+                "restreams": [
+                    {"name": d.name, "server": d.server, "key": d.key, "enabled": d.enabled}
+                    for d in self.destinations.values() if not d.is_primary
+                ],
+            }
+
+
+class InputPipeline:
+    """
+    Іменований ingest-шлях (plan.md §5.5): свій `live_path` для OBS-виходу,
+    служить джерелом для remux. БЕЗ backup/destinations/стейт-машини
+    непрерывності. Стан LIVE/OFFLINE веде публікація OBS (хуки MediaMTX).
+    Щоб показувати реальну аудіо/відео-статистику вхідного потоку (а не
+    лише boolean), тримає ЛЕГКИЙ stats-relay: власний ffmpeg-читач шляху
+    -> `FLVSwitcher` БЕЗ жодного sink (лише source_stats: kbps/flowing) +
+    разовий probe геометрії. Це окремий читач MediaMTX (незалежний від
+    того, що вхід ще й читає remux).
+    """
+
+    PIPELINE_TYPE = TYPE_INPUT
+
+    def __init__(self, manager, pcfg: dict, global_config: dict, base_dir: Path, log_dir: Path):
+        self._manager = manager
+        self.pcfg = pcfg
+        self._gcfg = global_config
+        self.base_dir = base_dir
+        self.log_dir = log_dir
+        self.name = pcfg["name"]
+        self.is_default = False  # input ніколи не дефолтний
+        self.enabled = True      # немає площадок -> master-гейт незастосовний
+        self.live_path = pcfg["live_path"]
+        self.lock = threading.RLock()
+        self.state = STATE_OFFLINE
+        self._state_since = time.time()
+
+        mtx_host = global_config["mediamtx_rtmp_host"]
+        mtx_port = global_config["mediamtx_rtmp_port"]
+        user = global_config["internal_user"]
+        password = global_config["internal_pass"]
+        live_url = f"rtmp://{mtx_host}:{mtx_port}/{self.live_path}?user={user}&pass={password}"
+        self._live_probe_url = live_url
+        self._last_params: dict | None = None  # геометрія з probe (для тултипу)
+
+        self.switcher = FLVSwitcher()  # без sink-ів -- лише лічильник source_stats
+        tag = _safe_proc_name(self.name)
+        self.relay = FfmpegProcess(
+            f"input-{tag}",
+            ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", live_url,
+             "-c", "copy", "-f", "flv", "pipe:1"],
+            log_dir,
+            capture_stdout=True,
+            on_start=self._on_relay_start,
+        )
+
+    def _on_relay_start(self, proc):
+        threading.Thread(
+            target=read_flv_tags,
+            args=(proc.stdout, "relay", self.switcher.process),
+            daemon=True,
+        ).start()
+
+    def _probe_async(self) -> None:
+        def run():
+            params = probe_stream_params(self._live_probe_url)
+            if params:
+                self._last_params = params
+        threading.Thread(target=run, daemon=True).start()
+
+    def subscriptions(self) -> list[tuple[str, str]]:
+        return [(self.live_path, "owner")]
+
+    def on_available(self) -> None:
+        with self.lock:
+            if self.state != STATE_LIVE:
+                logging.info("[%s] input is publishing -> LIVE", self.name)
+                self.state = STATE_LIVE
+                self._state_since = time.time()
+                self.relay.start()      # почати вимірювати вхідний потік
+                self._probe_async()     # геометрія для тултипу
+        self._manager._notify()
+
+    def on_unavailable(self) -> None:
+        with self.lock:
+            if self.state != STATE_OFFLINE:
+                logging.info("[%s] input stopped publishing -> OFFLINE", self.name)
+                self.state = STATE_OFFLINE
+                self._state_since = time.time()
+                self.relay.stop()
+                self._last_params = None
+        self._manager._notify()
+
+    # --- no-op хуки життєвого циклу (input не має виходів/сесії) ---
+
+    def halt(self) -> bool:
+        # Стан входу веде виключно публікація OBS; HALT сам вхід не «зупиняє».
+        return False
+
+    def graceful_stop_if_fallback(self) -> None:
+        pass
+
+    def set_master(self, active: bool) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        with self.lock:
+            self.relay.stop()
+
+    def list_destinations(self) -> list:
+        return []
+
+    def outputs_for_settings(self) -> list[dict]:
+        return []
+
+    def destination_names(self) -> list[str]:
+        return []
+
+    def status(self) -> dict:
+        with self.lock:
+            obs = self.switcher.source_stats()
+            if self._last_params:
+                for key in ("width", "height", "fps", "video_codec", "audio_codec"):
+                    obs[key] = self._last_params.get(key)
+            return {
+                "name": self.name,
+                "type": self.PIPELINE_TYPE,
+                "is_default": False,
+                "enabled": True,
+                "state": self.state,
+                "state_since": self._state_since,
+                "halted": False,
+                "live_path": self.live_path,
+                "obs": obs,
+                "destinations": [],
+            }
+
+    def to_config(self) -> dict:
+        with self.lock:
+            return {
+                "name": self.name,
+                "type": self.PIPELINE_TYPE,
+                "is_default": False,
+                "enabled": True,
+                "live_path": self.live_path,
+            }
+
+
 class Manager:
     """
     Верхній рівень: те, що завʼязано на "один OBS". Створює пайплайни з
@@ -911,7 +1362,11 @@ class Manager:
         self._backup_cache = BackupCache(self.base_dir / "data" / "backup-cache")
 
         self.pipelines: dict[str, Pipeline] = {}
-        self._by_path: dict[str, Pipeline] = {}
+        # 1:N роутинг хуків (§5.4): один ingest-шлях може годувати кілька
+        # пайплайнів. Значення -- список підписників (pipeline, role), де
+        # role ∈ {"owner","video","audio"}. owner -> on_available/
+        # on_unavailable; video/audio -> remux.on_source_(un)available.
+        self._by_path: dict[str, list[tuple]] = {}
         # Пряме посилання на дефолтний пайплайн (оновлюється в
         # _instantiate_pipeline під Manager.lock). Аукс-пайплайни читають
         # його стан БЕЗ Manager.lock (is_main_session_live) -- щоб не було
@@ -922,13 +1377,34 @@ class Manager:
 
         threading.Thread(target=self._ping_loop, name="ping", daemon=True).start()
 
-    def _instantiate_pipeline(self, pcfg: dict) -> Pipeline:
-        pipeline = Pipeline(self, pcfg, self.config, self.base_dir, self.log_dir)
+    def _instantiate_pipeline(self, pcfg: dict):
+        ptype = pcfg.get("type", TYPE_RESTREAM)
+        if ptype == TYPE_INPUT:
+            pipeline = InputPipeline(self, pcfg, self.config, self.base_dir, self.log_dir)
+        elif ptype == TYPE_REMUX:
+            pipeline = RemuxPipeline(self, pcfg, self.config, self.base_dir, self.log_dir)
+        else:
+            pipeline = Pipeline(self, pcfg, self.config, self.base_dir, self.log_dir)
         self.pipelines[pipeline.name] = pipeline
-        self._by_path[pipeline.live_path] = pipeline
+        self._register_subscriptions(pipeline)
         if pipeline.is_default:
             self._default = pipeline
         return pipeline
+
+    def _register_subscriptions(self, pipeline) -> None:
+        # Під Manager.lock. Кожна (path, role)-підписка пайплайна ->
+        # список підписників цього шляху (1:N).
+        for path, role in pipeline.subscriptions():
+            self._by_path.setdefault(path, []).append((pipeline, role))
+
+    def _unregister_subscriptions(self, pipeline) -> None:
+        # Під Manager.lock. Знімає всі підписки пайплайна з усіх шляхів.
+        for path in list(self._by_path):
+            remaining = [s for s in self._by_path[path] if s[0] is not pipeline]
+            if remaining:
+                self._by_path[path] = remaining
+            else:
+                self._by_path.pop(path, None)
 
     def _default_pipeline(self) -> Pipeline:
         for p in self.pipelines.values():
@@ -938,19 +1414,20 @@ class Manager:
         # всяк -- перший.
         return next(iter(self.pipelines.values()))
 
-    def _pipeline_for_path(self, path: str | None) -> Pipeline | None:
+    def _subscribers_for_path(self, path: str | None) -> list[tuple]:
         if path is None:
             # Back-compat: хук без ?path (одношляхова конфігурація) ->
-            # дефолтний пайплайн.
-            return self._default_pipeline()
-        return self._by_path.get(path)
+            # дефолтний пайплайн як owner.
+            default = self._default_pipeline()
+            return [(default, "owner")] if default is not None else []
+        return list(self._by_path.get(path, ()))
 
-    # --- хуки MediaMTX (роутинг по шляху) ---
+    # --- хуки MediaMTX (роутинг по шляху, 1:N §5.4) ---
 
     def on_available(self, path: str | None = None) -> None:
         with self.lock:
-            pipeline = self._pipeline_for_path(path)
-            if pipeline is None:
+            subscribers = self._subscribers_for_path(path)
+            if not subscribers:
                 logging.warning("available hook for unknown path %r -- ignoring", path)
                 return
             # Життєвий цикл пайплайна керується ЛИШЕ публікацією OBS на його
@@ -960,22 +1437,30 @@ class Manager:
             if self._is_current_session_halted():
                 # Ця сесія OBS заглушена з дашборда (HALT) -- не стартуємо
                 # ефір на її (пере)публікацію. Латч глобальний: діє на всі
-                # пайплайни цієї сесії. Стоп самому OBS шлеться, коли його
-                # obs-source (пере)підключиться (register_source).
+                # пайплайни (owner+remux) цієї сесії. Стоп самому OBS шлеться,
+                # коли його obs-source (пере)підключиться (register_source).
                 logging.info(
                     "OBS is publishing (path=%s), but this session was halted from the dashboard "
                     "-> ignoring (not restarting the broadcast)", path,
                 )
                 return
-            pipeline.on_available()
+            for pipeline, role in subscribers:
+                if role == "owner":
+                    pipeline.on_available()
+                else:
+                    pipeline.on_source_available(role)
 
     def on_unavailable(self, path: str | None = None) -> None:
         with self.lock:
-            pipeline = self._pipeline_for_path(path)
-            if pipeline is None:
+            subscribers = self._subscribers_for_path(path)
+            if not subscribers:
                 logging.warning("unavailable hook for unknown path %r -- ignoring", path)
                 return
-            pipeline.on_unavailable()
+            for pipeline, role in subscribers:
+                if role == "owner":
+                    pipeline.on_unavailable()
+                else:
+                    pipeline.on_source_unavailable(role)
 
     # --- сигнали OBS / латч / оракул ---
 
@@ -1061,8 +1546,12 @@ class Manager:
         threading.Thread(target=_decide, daemon=True).start()
 
     def _any_pipeline_alive(self) -> bool:
-        # Під Manager.lock. "Живий" = увімкнений і не в OFFLINE.
+        # Під Manager.lock. "Живий" = має виходи (не input), увімкнений і не
+        # в OFFLINE. Input не бродкастить -> не рахуємо його «живим» для
+        # failsafe-рішення про OBS-стоп.
         for p in self.pipelines.values():
+            if p.PIPELINE_TYPE == TYPE_INPUT:
+                continue
             if p.enabled and p.state != STATE_OFFLINE:
                 return True
         return False
@@ -1150,7 +1639,7 @@ class Manager:
 
     def enable_output(self, name: str, pipeline: str | None = None) -> None:
         with self.lock:
-            p = self._resolve_pipeline(pipeline)
+            p = self._resolve_output_pipeline(pipeline)
             if p is None:
                 return
             p.enable_destination(name)
@@ -1158,7 +1647,7 @@ class Manager:
 
     def disable_output(self, name: str, pipeline: str | None = None) -> None:
         with self.lock:
-            p = self._resolve_pipeline(pipeline)
+            p = self._resolve_output_pipeline(pipeline)
             if p is None:
                 return
             p.disable_destination(name)
@@ -1166,7 +1655,7 @@ class Manager:
 
     def add_output(self, name: str, server: str, key: str, pipeline: str | None = None) -> None:
         with self.lock:
-            p = self._resolve_pipeline(pipeline)
+            p = self._resolve_output_pipeline(pipeline)
             if p is None:
                 return
             p.add_destination(name, server, key)
@@ -1174,7 +1663,7 @@ class Manager:
 
     def update_output(self, name: str, new_name: str, server: str, key: str, pipeline: str | None = None) -> None:
         with self.lock:
-            p = self._resolve_pipeline(pipeline)
+            p = self._resolve_output_pipeline(pipeline)
             if p is None:
                 return
             p.update_destination(name, new_name, server, key)
@@ -1182,16 +1671,23 @@ class Manager:
 
     def remove_output(self, name: str, pipeline: str | None = None) -> None:
         with self.lock:
-            p = self._resolve_pipeline(pipeline)
+            p = self._resolve_output_pipeline(pipeline)
             if p is None:
                 return
             p.remove_destination(name)
             self._persist_locked()
 
-    def _resolve_pipeline(self, name: str | None) -> Pipeline | None:
+    def _resolve_pipeline(self, name: str | None):
         if name is None:
             return self._default_pipeline()
         return self.pipelines.get(name)
+
+    def _resolve_output_pipeline(self, name: str | None):
+        # Площадки є лише в output-типів (restream/remux); input їх не має.
+        p = self._resolve_pipeline(name)
+        if p is None or p.PIPELINE_TYPE == TYPE_INPUT:
+            return None
+        return p
 
     def outputs_for_settings(self, pipeline: str | None = None) -> list[dict]:
         with self.lock:
@@ -1207,13 +1703,20 @@ class Manager:
     # шляхи пре-провизионені §5.1). Валідацію робить викликач (http_server
     # -> settings_store.validate_pipeline). ---
 
+    def _default_backup_file(self) -> str:
+        """backup_file дефолтного (main) пайплайна -- дефолт для нових (спільна заглушка -- частий кейс)."""
+        d = self._default
+        return d.pcfg.get("backup_file", "") if d is not None and hasattr(d, "pcfg") else ""
+
     def add_pipeline(self, name: str, backup_file: str) -> None:
+        """Restream-пайплайн (свій вхід + виходи). Тип за замовчуванням."""
         with self.lock:
             if name in self.pipelines:
                 return
             live_path = self._assign_path(name)  # авто-призначення (без комбобокса)
+            backup_file = backup_file or self._default_backup_file()
             pcfg = {
-                "name": name, "is_default": False, "enabled": False,
+                "name": name, "type": TYPE_RESTREAM, "is_default": False, "enabled": False,
                 "live_path": live_path, "backup_file": backup_file,
                 # Плейсхолдер-primary (обов'язковий інваріант пайплайна) --
                 # вимкнений і порожній; користувач заповнить у модалці площадки.
@@ -1221,8 +1724,55 @@ class Manager:
                 "primary_enabled": False, "restreams": [],
             }
             self._instantiate_pipeline(pcfg)
-            logging.info("added pipeline %s on auto-assigned path %s", name, live_path)
+            logging.info("added restream pipeline %s on auto-assigned path %s", name, live_path)
             self._persist_locked()
+
+    def add_input_pipeline(self, name: str) -> None:
+        """Іменований ingest-вхід без виходів (джерело для remux)."""
+        with self.lock:
+            if name in self.pipelines:
+                return
+            live_path = self._assign_path(name)
+            pcfg = {"name": name, "type": TYPE_INPUT, "is_default": False,
+                    "enabled": True, "live_path": live_path}
+            self._instantiate_pipeline(pcfg)
+            logging.info("added input pipeline %s on auto-assigned path %s", name, live_path)
+            self._persist_locked()
+
+    def add_remux_pipeline(self, name: str, video_src_path: str, audio_src_path: str, backup_file: str) -> None:
+        """Remux-пайплайн: video з одного чужого входу + audio з іншого; свого шляху не має."""
+        with self.lock:
+            if name in self.pipelines:
+                return
+            backup_file = backup_file or self._default_backup_file()
+            pcfg = {
+                "name": name, "type": TYPE_REMUX, "is_default": False, "enabled": False,
+                "video_src_path": video_src_path, "audio_src_path": audio_src_path,
+                "audio_trim_ms": 0, "backup_file": backup_file,
+                "primary_name": "primary", "primary_server": "", "primary_key": "",
+                "primary_enabled": False, "restreams": [],
+            }
+            self._instantiate_pipeline(pcfg)
+            logging.info("added remux pipeline %s (video=%s audio=%s)", name, video_src_path, audio_src_path)
+            self._persist_locked()
+
+    def source_candidates(self) -> list[dict]:
+        """Пайплайни, придатні як джерело для remux (restream/input, мають live_path)."""
+        with self.lock:
+            return [
+                {"name": p.name, "live_path": p.live_path, "type": p.PIPELINE_TYPE}
+                for p in self._ordered_pipelines()
+                if p.PIPELINE_TYPE in (TYPE_RESTREAM, TYPE_INPUT)
+            ]
+
+    def remux_referencing(self, live_path: str) -> list[str]:
+        """Імена remux-пайплайнів, що посилаються на цей live_path (для guard видалення)."""
+        with self.lock:
+            names = []
+            for p in self.pipelines.values():
+                if p.PIPELINE_TYPE == TYPE_REMUX and live_path in (p.video_src_path, p.audio_src_path):
+                    names.append(p.name)
+            return names
 
     def _assign_path(self, name: str) -> str:
         # Дружній slug з імені -> live/<slug>; гарантуємо унікальність
@@ -1238,26 +1788,41 @@ class Manager:
             i += 1
         return candidate
 
-    def update_pipeline(self, name: str, new_name: str, backup_file: str) -> None:
+    def update_pipeline(self, name: str, new_name: str, backup_file: str,
+                        video_src_path: str | None = None, audio_src_path: str | None = None) -> None:
         with self.lock:
             old = self.pipelines.get(name)
             if old is None:
                 return
-            # Шлях (live_path) СТАБІЛЬНИЙ -- при перейменуванні не міняється
-            # (інакше зламався б уже налаштований OBS-вихід). Rename ->
-            # чисте перестворення (імена процесів/логів тегуються іменем),
-            # шлях і площадки переносимо через to_config().
-            if new_name != name:
+            is_remux = old.PIPELINE_TYPE == TYPE_REMUX
+            # Структурна зміна (rename АБО зміна джерел remux) -> чисте
+            # перестворення: імена процесів/логів тегуються іменем, а підписки
+            # remux залежать від source-шляхів, тож їх треба перереєструвати.
+            # Шлях (live_path) СТАБІЛЬНИЙ при rename (інакше зламався б уже
+            # налаштований OBS-вихід) -- переноситься через to_config().
+            sources_changed = is_remux and (
+                (video_src_path is not None and video_src_path != old.video_src_path)
+                or (audio_src_path is not None and audio_src_path != old.audio_src_path)
+            )
+            if new_name != name or sources_changed:
                 new_pcfg = old.to_config()
                 new_pcfg["name"] = new_name
-                new_pcfg["backup_file"] = backup_file
+                if old.PIPELINE_TYPE != TYPE_INPUT:
+                    new_pcfg["backup_file"] = backup_file
+                if is_remux:
+                    if video_src_path is not None:
+                        new_pcfg["video_src_path"] = video_src_path
+                    if audio_src_path is not None:
+                        new_pcfg["audio_src_path"] = audio_src_path
                 old.shutdown()
                 self.pipelines.pop(name, None)
-                self._by_path.pop(old.live_path, None)
+                self._unregister_subscriptions(old)
                 self._instantiate_pipeline(new_pcfg)
-                logging.info("recreated pipeline %s -> %s (path %s kept)", name, new_name, old.live_path)
+                logging.info("recreated pipeline %s -> %s", name, new_name)
             else:
-                old.apply_local_settings(backup_file=backup_file)
+                # input не має backup -- apply_local_settings лише в output-типів.
+                if hasattr(old, "apply_local_settings"):
+                    old.apply_local_settings(backup_file=backup_file)
                 logging.info("updated pipeline %s (backup)", name)
             self._persist_locked()
 
@@ -1268,7 +1833,7 @@ class Manager:
                 return  # дефолтний незнищенний
             p.shutdown()
             self.pipelines.pop(name, None)
-            self._by_path.pop(p.live_path, None)
+            self._unregister_subscriptions(p)
             logging.info("removed pipeline %s", name)
             self._persist_locked()
 
@@ -1293,17 +1858,40 @@ class Manager:
             p.set_master(False)
             self._persist_locked()
 
+    def set_audio_trim(self, name: str, ms: int) -> None:
+        """Ручний аудіо-триммер remux (§5.2), live-apply + персист."""
+        with self.lock:
+            p = self.pipelines.get(name)
+            if p is None or p.PIPELINE_TYPE != TYPE_REMUX:
+                return
+            p.set_audio_trim(ms)
+            self._persist_locked()
+
     # --- аксессори для валідації/Settings ---
 
     def pipeline_names(self) -> list[str]:
         with self.lock:
             return list(self.pipelines.keys())
 
+    def pipeline_type(self, name: str) -> str | None:
+        with self.lock:
+            p = self.pipelines.get(name)
+            return p.PIPELINE_TYPE if p else None
+
+    def blocking_remux_for(self, name: str) -> list[str]:
+        """Remux-пайплайни, для яких `name` є джерелом (не даємо видалити джерело з-під живого remux, §4.4)."""
+        with self.lock:
+            p = self.pipelines.get(name)
+            live_path = getattr(p, "live_path", None) if p else None
+            if not live_path:
+                return []
+            return self.remux_referencing(live_path)
+
     def _ingest_key(self, live_path: str) -> str:
         # Готовий OBS Stream Key для цього пайплайна: "<sub>?user=obs&pass=
         # <obspass>", де sub -- шлях без префікса "live/". Порожній, якщо
         # obs-пароль не вдалось прочитати з mediamtx.yml.
-        if not self._obs_ingest_pass:
+        if not self._obs_ingest_pass or not live_path:
             return ""
         sub = live_path[len("live/"):] if live_path.startswith("live/") else live_path
         return f"{sub}?user=obs&pass={self._obs_ingest_pass}"
@@ -1320,21 +1908,27 @@ class Manager:
             pipelines = self._ordered_pipelines()
         server = f"rtmp://{self._public_host}:{self._rtmp_port}/live" if self._public_host else ""
         # outputs_for_settings кожного пайплайна бере власний lock окремо.
-        result = [
-            {
+        result = []
+        for p in pipelines:
+            entry = {
                 "name": p.name,
+                "type": p.PIPELINE_TYPE,
                 "is_default": p.is_default,
                 "enabled": p.enabled,
                 "live_path": p.live_path,
                 "backup_file": p.pcfg.get("backup_file", ""),
                 # Готова інфа для налаштування OBS-виходу (замість комбобокса
-                # шляхів): куди публікувати цей пайплайн.
-                "ingest_server": server,
+                # шляхів): куди публікувати цей пайплайн. Для remux -- порожня
+                # (свого входу немає, публікувати нема куди).
+                "ingest_server": server if p.live_path else "",
                 "ingest_key": self._ingest_key(p.live_path),
                 "platforms": p.outputs_for_settings(),
             }
-            for p in pipelines
-        ]
+            if p.PIPELINE_TYPE == TYPE_REMUX:
+                entry["video_src_path"] = p.video_src_path
+                entry["audio_src_path"] = p.audio_src_path
+                entry["audio_trim_ms"] = p.audio_trim_ms
+            result.append(entry)
         return result  # вже впорядковано (_ordered_pipelines: дефолтний першим)
 
     # --- глобальні System-налаштування ---

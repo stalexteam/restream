@@ -215,12 +215,20 @@ body.ws-disconnected #tab-settings {
   gap: 5px;
 }
 
+/* A class rule with `display` beats the UA `[hidden]{display:none}`, so a
+   `.field` toggled via the hidden attribute (remux sources, backup, OBS
+   output — shown per pipeline type) needs this to actually hide. */
+.field[hidden] {
+  display: none;
+}
+
 .field label {
   font-size: 12px;
   color: var(--muted);
 }
 
-.field input {
+.field input,
+.field select {
   width: 100%;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -231,9 +239,67 @@ body.ws-disconnected #tab-settings {
   padding: 7px 9px;
 }
 
-.field input:focus {
+/* Native <select> is short and uses OS colors -- match the text inputs:
+   same height/padding/border, themed chevron, no OS accent. */
+.field select {
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  /* room for the chevron; a themed SVG arrow drawn via background. */
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath fill='%238b909a' d='M2 4l4 4 4-4z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 12px;
+}
+
+.field input:focus,
+.field select:focus {
   outline: 2px solid var(--blue);
   outline-offset: -1px;
+}
+
+/* The open dropdown list: Chromium (incl. the OBS Custom Browser Dock) honors
+   option background/color, so theme the popup instead of OS defaults. The
+   padding only takes effect where the customizable select is supported (see
+   @supports below); it's harmless on older native popups that ignore it. */
+.field select option {
+  background: var(--panel);
+  color: var(--fg);
+  padding: 9px 12px;
+}
+.field select option:checked {
+  background: var(--blue);
+  color: #fff;
+}
+
+/* Customizable <select> (Chrome 135+, incl. recent CEF/OBS dock): fully style
+   the popup -- taller items and a popover radius that matches the inputs
+   (4px), instead of the browser's default rounding. Older browsers ignore
+   this block and keep the native popup above. */
+@supports (appearance: base-select) {
+  .field select {
+    appearance: base-select;
+    background-image: none;  /* base-select draws its own ::picker-icon */
+    padding-right: 9px;
+  }
+  .field select::picker(select) {
+    appearance: base-select;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  }
+  .field select option {
+    border-radius: 4px;
+  }
+  .field select option:hover {
+    background: var(--border);
+  }
+  .field select::picker-icon {
+    color: var(--muted);
+  }
 }
 
 /* Чекбокс-поле: лейбл із чекбоксом в один рядок (не колонкою, як
@@ -688,11 +754,24 @@ body.ws-disconnected #tab-settings {
 }
 
 .pipeline-title {
+  /* Flex so the title text and its badges (type tag, ★) line up centered,
+     instead of an inline pill sitting slightly high off the baseline. */
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 13px;
   font-weight: 700;
   text-transform: none;
   letter-spacing: 0;
   color: var(--fg);
+}
+
+/* A pipeline panel with no body (e.g. an input in the Settings list): make the
+   head fill the whole panel -- no reserved empty space, no divider below. */
+.pipeline-panel.compact .pipeline-head {
+  margin-bottom: -14px;
+  border-bottom: none;
+  border-radius: 4px;
 }
 
 .pipeline-toggle-wrap {
@@ -806,4 +885,57 @@ body.ws-disconnected #tab-settings {
    columns (the tall Show button covers only the Server/Key rows above). */
 .masked-grid-full {
   grid-column: 2 / span 2;
+}
+
+/* --- pipeline types (remux / input) --- */
+
+/* Small tag next to a non-restream pipeline's title. */
+.pl-type-tag {
+  font-size: 0.7em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  vertical-align: middle;
+}
+.pl-type-restream { color: var(--green); border-color: var(--green); }
+.pl-type-remux { color: var(--blue); border-color: var(--blue); }
+.pl-type-input { color: var(--orange); border-color: var(--orange); }
+
+/* Control-tab: input placeholder + remux source/trim block. */
+.input-note {
+  color: var(--muted);
+  font-size: 0.9em;
+  padding: 6px 2px;
+}
+.remux-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  padding: 6px 2px 10px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.remux-sources { font-size: 0.9em; }
+
+/* Settings-tab: which inputs feed a remux. */
+.remux-src-summary {
+  color: var(--muted);
+  font-size: 0.9em;
+  padding: 2px 2px 8px;
+}
+
+/* When a pipeline has no master toggle (input), keep the title aligned. */
+.pipeline-toggle-wrap.no-toggle { cursor: default; }
+
+/* One-line type hint under the Type selector in the create widget. */
+.type-choice-desc {
+  color: var(--muted);
+  font-size: 0.88em;
+  line-height: 1.35;
+  margin-top: 4px;
 }

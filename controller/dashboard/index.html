@@ -110,6 +110,32 @@
   </div>
 </div>
 
+<!-- CREATE pipeline: choose type + name; OK creates it, then the type-specific
+     edit widget opens automatically to configure the rest. -->
+<div id="pipeline-create-modal" class="modal-overlay" hidden>
+  <div class="modal">
+    <h2>Add pipeline</h2>
+    <div class="field">
+      <label for="pcreate-type">Type</label>
+      <select id="pcreate-type">
+        <option value="restream">Restream — own input → platforms</option>
+        <option value="input">Input — named ingest, source for a remux</option>
+        <option value="remux">Remux — video from one input + audio from another</option>
+      </select>
+      <div class="type-choice-desc" id="pcreate-type-desc"></div>
+    </div>
+    <div class="field">
+      <label for="pcreate-name">Name</label>
+      <input type="text" id="pcreate-name" placeholder="e.g. clean" autocomplete="off" spellcheck="false">
+    </div>
+    <div id="pcreate-errors" class="errors" hidden></div>
+    <div class="actions">
+      <button type="button" id="pcreate-cancel">Cancel</button>
+      <button type="button" id="pcreate-ok" class="primary">OK</button>
+    </div>
+  </div>
+</div>
+
 <!-- add/modify PIPELINE modal -->
 <div id="pipeline-modal" class="modal-overlay" hidden>
   <div class="modal">
@@ -118,7 +144,17 @@
       <label for="pmodal-name">Name</label>
       <input type="text" id="pmodal-name" placeholder="e.g. clean" autocomplete="off" spellcheck="false">
     </div>
-    <div class="field">
+    <div class="field" id="pmodal-remux-field" hidden>
+      <label for="pmodal-video-src">Video source (its video is used)</label>
+      <select id="pmodal-video-src"></select>
+      <label for="pmodal-audio-src">Audio source (its audio is used)</label>
+      <select id="pmodal-audio-src"></select>
+    </div>
+    <div class="field" id="pmodal-trim-field" hidden>
+      <label for="pmodal-trim">Audio trim (ms) — one-time lip-sync calibration; set by eye, applies live</label>
+      <input type="number" id="pmodal-trim" min="-2000" max="2000" step="5" value="0" inputmode="numeric">
+    </div>
+    <div class="field" id="pmodal-backup-field">
       <label for="pmodal-backup">Backup video path (on the VPS) -- may be shared with another pipeline</label>
       <input type="text" id="pmodal-backup" placeholder="/path/to/backup.mp4" autocomplete="off" spellcheck="false">
     </div>
@@ -167,6 +203,10 @@
       </label>
       <span class="pill pl-badge"></span>
     </div>
+    <div class="remux-controls" hidden>
+      <div class="remux-sources"></div>
+    </div>
+    <div class="input-note" hidden>Named input — no platforms. Serves as a source for remux pipelines; its state follows OBS publishing to its path.</div>
     <table class="control-table">
       <thead>
         <tr>

@@ -43,6 +43,20 @@
     pmodal: document.getElementById("pipeline-modal"),
     pmodalTitle: document.getElementById("pipeline-modal-title"),
     pmodalName: document.getElementById("pmodal-name"),
+    // create widget (type + name), shown on "Add pipeline"
+    pcreateModal: document.getElementById("pipeline-create-modal"),
+    pcreateType: document.getElementById("pcreate-type"),
+    pcreateTypeDesc: document.getElementById("pcreate-type-desc"),
+    pcreateName: document.getElementById("pcreate-name"),
+    pcreateErrors: document.getElementById("pcreate-errors"),
+    pcreateOk: document.getElementById("pcreate-ok"),
+    pcreateCancel: document.getElementById("pcreate-cancel"),
+    pmodalRemuxField: document.getElementById("pmodal-remux-field"),
+    pmodalVideoSrc: document.getElementById("pmodal-video-src"),
+    pmodalAudioSrc: document.getElementById("pmodal-audio-src"),
+    pmodalTrimField: document.getElementById("pmodal-trim-field"),
+    pmodalTrim: document.getElementById("pmodal-trim"),
+    pmodalBackupField: document.getElementById("pmodal-backup-field"),
     pmodalBackup: document.getElementById("pmodal-backup"),
     pmodalIngestField: document.getElementById("pmodal-ingest-field"),
     pmodalIngestServer: document.getElementById("pmodal-ingest-server"),
@@ -73,7 +87,11 @@
   let modalSecretsShown = false; // reveal state of Server/Key/URL (masked by default)
   // pipeline modal context
   let pmodalMode = null;         // "add" | "edit" | null
+  let pmodalType = "restream";   // the pipeline's type (fixed once created)
   let pmodalEditingName = null;
+  // after a successful create, the edit widget for this pipeline auto-opens
+  // once the refreshed settings arrive.
+  let pendingEditName = null;
   let pmodalServerRaw = "";      // ingest Server (host:port) of the pipeline being edited
   let pmodalKeyRaw = "";         // full ingest Stream Key of the pipeline being edited
   let pmodalIngestShown = false; // reveal state of Server+Key in the modal
@@ -170,6 +188,7 @@
           loadedSettings = message.data;
           populateSystemForm(message.data);
           renderPipelinesSettings();
+          maybeOpenPendingEdit();  // auto-open edit after a successful create
           break;
         case "settings_saved":
           handleSettingsSaved(message);
@@ -249,12 +268,34 @@
   // (Status has no toggle; Control/Settings do, so it's omitted there).
   function setPipelineTitle(el, p, withDisabled) {
     el.textContent = p.name;
+    // Every pipeline carries a small type tag (restream/input/remux) so the
+    // three kinds are visually distinct across Status/Control/Settings.
+    const type = p.type || "restream";
+    const tag = document.createElement("span");
+    tag.className = "pl-type-tag pl-type-" + type;
+    tag.textContent = type;
+    el.append(" ", tag);
     if (p.is_default) { appendStar(el, "Default"); return; }
     if (withDisabled && !p.enabled) el.append(" (disabled)");
   }
 
+  // An input is "used" if at least one remux references it as a source.
+  function inputUsedBy(p) {
+    return pipelines().filter(
+      (x) => x.type === "remux" && (x.video_src_path === p.live_path || x.audio_src_path === p.live_path),
+    );
+  }
+
   // Broadcast badge (what goes OUT) for one pipeline. manual_halt is global.
   function badgeFor(p) {
+    // Input pipelines don't broadcast -- the badge reflects whether OBS is
+    // publishing to this input and whether a remux actually consumes it.
+    if (p.type === "input") {
+      if (p.state !== "LIVE") return { text: "OFFLINE", cls: "bstate-offline" };
+      return inputUsedBy(p).length
+        ? { text: "USED", cls: "bstate-live" }
+        : { text: "IDLE", cls: "bstate-idle" };
+    }
     if (p.state === "OFFLINE") {
       if (state.manual_halt) return { text: "HALTED", cls: "bstate-halt" };
       if (p.halted) return { text: "FAILURE", cls: "bstate-halt" };
@@ -275,8 +316,14 @@
     const bi = badgeFor(p);
     badge.className = "pill pl-badge " + bi.cls;
     badge.textContent = bi.text;
-    badge.title = BADGE_HELP;
+    badge.title = p.type === "input" ? INPUT_BADGE_HELP : BADGE_HELP;
   }
+
+  const INPUT_BADGE_HELP =
+    "Input source — a named ingest that feeds a remux (it doesn't broadcast on its own):\n" +
+    "• USED — OBS is publishing to this input and at least one remux uses it as a source\n" +
+    "• IDLE — OBS is publishing, but no remux references this input\n" +
+    "• OFFLINE — OBS is not publishing to this input";
 
   // --- render ---
 
@@ -342,6 +389,8 @@
     els.broadcastIndicator.textContent = info.text;
   }
 
+  function tick(ok) { return ok ? "✓" : "✗"; }
+
   function renderStatusPipelines() {
     els.statusPipelines.innerHTML = "";
     for (const p of pipelines()) {
@@ -349,19 +398,49 @@
       const title = frag.querySelector(".pipeline-title");
       setPipelineTitle(title, p, true);
       applyBadge(frag.querySelector(".pl-badge"), p);
-      const info = obsInfo(p);
       const data = frag.querySelector(".obs-data");
-      data.textContent = info.obs.flowing ? "flowing" : "no data";
-      data.className = "obs-data " + (info.obs.flowing ? "status-up" : "status-down");
-      frag.querySelector(".obs-video").textContent = info.vparts.length ? info.vparts.join(" · ") : "–";
-      frag.querySelector(".obs-audio").textContent = info.aparts.length ? info.aparts.join(" · ") : "–";
+      const vRow = frag.querySelector(".obs-video");
+      const aRow = frag.querySelector(".obs-audio");
+
+      if (p.type === "input") {
+        // Named ingest -- has its own stats relay now: show flowing + media
+        // params like a restream (its "OBS input" is the clean feed).
+        const info = obsInfo(p);
+        data.textContent = info.obs.flowing ? "flowing" : "no data";
+        data.className = "obs-data " + (info.obs.flowing ? "status-up" : "status-down");
+        vRow.textContent = info.vparts.length ? info.vparts.join(" · ") : "–";
+        aRow.textContent = info.aparts.length ? info.aparts.join(" · ") : "–";
+      } else if (p.type === "remux") {
+        // Two-input health: video ✓/✗ + audio ✓/✗ (the merge itself lands in
+        // phase 2; for now these mirror source availability).
+        const src = p.sources || {};
+        const both = !!src.video && !!src.audio;
+        data.textContent = both ? "both sources up" : "waiting for sources";
+        data.className = "obs-data " + (both ? "status-up" : "status-down");
+        vRow.textContent = `video ${tick(!!src.video)}  (${p.video_src_path || "?"})`;
+        vRow.className = "obs-video " + (src.video ? "status-up" : "status-down");
+        aRow.textContent = `audio ${tick(!!src.audio)}  (${p.audio_src_path || "?"})`;
+        aRow.className = "obs-audio " + (src.audio ? "status-up" : "status-down");
+      } else {
+        const info = obsInfo(p);
+        data.textContent = info.obs.flowing ? "flowing" : "no data";
+        data.className = "obs-data " + (info.obs.flowing ? "status-up" : "status-down");
+        vRow.textContent = info.vparts.length ? info.vparts.join(" · ") : "–";
+        aRow.textContent = info.aparts.length ? info.aparts.join(" · ") : "–";
+      }
       els.statusPipelines.appendChild(frag);
     }
   }
 
   function componentOrder() {
     const order = ["mediamtx", "controller"];
-    for (const p of pipelines()) { order.push(`relay:${p.name}`, `backup:${p.name}`); }
+    // Only the roles a pipeline of that type actually runs: restream ->
+    // relay+backup; remux -> backup (relay lands in phase 2); input -> none.
+    for (const p of pipelines()) {
+      if (p.type === "input") continue;
+      if (p.type === "remux") { order.push(`backup:${p.name}`); continue; }
+      order.push(`relay:${p.name}`, `backup:${p.name}`);
+    }
     return order;
   }
 
@@ -426,13 +505,22 @@
       // the title, so a status label would just duplicate it.
       setPipelineTitle(panel.querySelector(".pipeline-title"), p, false);
       applyBadge(panel.querySelector(".pl-badge"), p);
+
+      const isInput = p.type === "input";
+      const isRemux = p.type === "remux";
+      // Input has no platforms -> hide its master toggle + table, show a note.
+      panel.querySelector(".input-note").hidden = !isInput;
+      panel.querySelector(".control-table").hidden = isInput;
+
       // The header checkbox is a master AND-gate over this pipeline's
-      // platforms (every pipeline has one, default included): unchecking it
-      // mutes them all at once without touching their individual checkboxes.
+      // platforms (every OUTPUT pipeline has one, default included): unchecking
+      // it mutes them all at once. Input has none -> hide it.
       const toggle = panel.querySelector(".pipeline-toggle");
       if (toggle) {
+        toggle.closest(".pipeline-toggle-wrap").classList.toggle("no-toggle", isInput);
+        toggle.hidden = isInput;
         if (document.activeElement !== toggle) toggle.checked = p.enabled;
-        toggle.disabled = !live;
+        toggle.disabled = !live || isInput;
         if (!toggle.dataset.bound) {
           toggle.dataset.bound = "1";
           toggle.addEventListener("change", () => {
@@ -440,7 +528,13 @@
           });
         }
       }
-      renderControlRows(panel.querySelector("tbody"), p, live);
+
+      // Remux: source ✓/✗ + a live audio-trim slider (applies without reconnect).
+      const remuxControls = panel.querySelector(".remux-controls");
+      remuxControls.hidden = !isRemux;
+      if (isRemux) renderRemuxControls(panel, p);
+
+      if (!isInput) renderControlRows(panel.querySelector("tbody"), p, live);
     }
     // drop panels for removed pipelines
     for (const panel of Array.from(els.controlPipelines.children)) {
@@ -506,6 +600,17 @@
     for (const row of Array.from(tbody.children)) {
       if (!seen.has(row.dataset.name)) row.remove();
     }
+  }
+
+  // Remux control block: read-only two-input status + current A/V skew. The
+  // audio-trim calibration itself lives in the remux edit widget (set once).
+  function renderRemuxControls(panel, p) {
+    const src = p.sources || {};
+    panel.querySelector(".remux-sources").innerHTML =
+      `<span class="${src.video ? "status-up" : "status-down"}">video ${tick(!!src.video)}</span> ` +
+      `<span class="${src.audio ? "status-up" : "status-down"}">audio ${tick(!!src.audio)}</span> ` +
+      `&nbsp; skew: ${p.skew_ms != null ? p.skew_ms + " ms" : "–"}` +
+      `&nbsp; trim: ${p.audio_trim_ms || 0} ms`;
   }
 
   // --- clocks (fallback countdown on each pipeline badge tooltip) ---
@@ -621,11 +726,28 @@
         });
       }
 
-      renderPlatformList(panel.querySelector(".platforms-list"), p.name, p.platforms || [], live);
-
+      const isInput = p.type === "input";
       const addBtn = panel.querySelector(".pl-add-platform");
-      addBtn.disabled = !live;
-      addBtn.addEventListener("click", () => openPlatformModal("add", p.name, null));
+
+      if (p.type === "remux") {
+        // Summarize which inputs feed this remux (resolve paths -> names).
+        const summary = document.createElement("div");
+        summary.className = "remux-src-summary";
+        summary.textContent = `video ← ${srcName(p.video_src_path)}   ·   audio ← ${srcName(p.audio_src_path)}`;
+        panel.querySelector(".pipeline-head").after(summary);
+      }
+
+      if (isInput) {
+        // No platforms on an input -> hide the list and the add button, and
+        // collapse the panel to just its title bar (no empty body).
+        panel.querySelector(".platforms-list").hidden = true;
+        addBtn.remove();
+        panel.classList.add("compact");
+      } else {
+        renderPlatformList(panel.querySelector(".platforms-list"), p.name, p.platforms || [], live);
+        addBtn.disabled = !live;
+        addBtn.addEventListener("click", () => openPlatformModal("add", p.name, null));
+      }
 
       els.pipelinesList.appendChild(frag);
     }
@@ -750,11 +872,53 @@
 
   // --- pipeline modal ---
 
-  function openPipelineModal(mode, pipeline) {
+  // Resolve a source live_path to its pipeline name for display.
+  function srcName(livePath) {
+    const cands = (settingsData && settingsData.source_candidates) || [];
+    const m = cands.find((c) => c.live_path === livePath);
+    return m ? m.name : (livePath || "?");
+  }
+
+  function populateSourceSelect(select, selectedPath) {
+    select.innerHTML = "";
+    for (const c of (settingsData && settingsData.source_candidates) || []) {
+      const opt = document.createElement("option");
+      opt.value = c.live_path;
+      opt.textContent = `${c.name} (${c.type})`;
+      if (c.live_path === selectedPath) opt.selected = true;
+      select.appendChild(opt);
+    }
+  }
+
+  // Show only the fields a given pipeline type needs.
+  function applyPmodalType(type) {
+    const isInput = type === "input";
+    const isRemux = type === "remux";
+    els.pmodalRemuxField.hidden = !isRemux;
+    els.pmodalTrimField.hidden = !isRemux;   // audio trim calibration is remux-only
+    els.pmodalBackupField.hidden = isInput;  // input has no backup/output half
+  }
+
+  function openPipelineModal(mode, pipeline, presetType) {
     pmodalMode = mode;
     pmodalEditingName = mode === "edit" ? pipeline.name : null;
-    els.pmodalTitle.textContent = mode === "edit" ? `Modify pipeline ${pipeline.name}` : "Add pipeline";
+    const type = mode === "edit" ? (pipeline.type || "restream") : (presetType || "restream");
+    pmodalType = type;
+    // Type is fixed once created -> shown in the title, not as an editable field.
+    els.pmodalTitle.textContent = mode === "edit"
+      ? `Modify ${type} pipeline: ${pipeline.name}`
+      : `Add ${type} pipeline`;
     els.pmodalName.value = mode === "edit" ? pipeline.name : "";
+
+    // Remux sources: editable in the edit widget (this is where a freshly
+    // created remux gets its two inputs assigned).
+    populateSourceSelect(els.pmodalVideoSrc, mode === "edit" ? pipeline.video_src_path : null);
+    populateSourceSelect(els.pmodalAudioSrc, mode === "edit" ? pipeline.audio_src_path : null);
+    els.pmodalVideoSrc.disabled = false;
+    els.pmodalAudioSrc.disabled = false;
+    els.pmodalTrim.value = (mode === "edit" ? (pipeline.audio_trim_ms || 0) : 0);
+    applyPmodalType(type);
+
     // New pipeline: default the backup file to the default pipeline's, since
     // a shared backup source is the common case (each pipeline still prepares
     // it under its own params); the operator can point it elsewhere. The
@@ -797,19 +961,81 @@
     hidePipelineModalErrors();
     const name = els.pmodalName.value.trim();
     const backup_file = els.pmodalBackup.value.trim();
-    if (pmodalMode === "add") {
-      send({ command: "add_pipeline", name, backup_file });
-    } else {
-      // On rename, `name` must stay the OLD name (the lookup key); the new one
-      // goes in `new_name`. (Don't spread a payload whose own `name` field
-      // would clobber the lookup key.)
-      send({ command: "update_pipeline", name: pmodalEditingName, new_name: name, backup_file });
+    // The edit widget is the only place that submits full config. On rename,
+    // `name` must stay the OLD name (the lookup key); the new one goes in
+    // `new_name`. For remux the two source paths travel too.
+    const payload = { command: "update_pipeline", name: pmodalEditingName, new_name: name, backup_file };
+    if (pmodalType === "remux") {
+      payload.video_src_path = els.pmodalVideoSrc.value;
+      payload.audio_src_path = els.pmodalAudioSrc.value;
     }
+    send(payload);
   }
   function handlePipelineResult(message) {
+    // Create widget open -> this is a create result. On success we close it and
+    // let the edit widget auto-open once the refreshed settings arrive.
+    if (!els.pcreateModal.hidden) {
+      if (message.ok) {
+        closeCreateModal();
+      } else {
+        pendingEditName = null;
+        showErrorsInto(els.pcreateErrors, message.errors || {});
+      }
+      return;
+    }
     if (els.pmodal.hidden) return;
     if (message.ok) closePipelineModal();
     else showPipelineModalErrors(message.errors || {});
+  }
+
+  function showErrorsInto(container, errors) {
+    container.innerHTML = "";
+    for (const [field, text] of Object.entries(errors)) {
+      const line = document.createElement("div");
+      line.textContent = field === "_" ? text : `${field}: ${text}`;
+      container.appendChild(line);
+    }
+    container.hidden = Object.keys(errors).length === 0;
+  }
+
+  // --- create widget (type + name) ---
+
+  const CREATE_TYPE_DESC = {
+    restream: "Own RTMP input → one or more platforms (Twitch, YouTube, …), with a backup video.",
+    input: "A named ingest path with no platforms — used only as a source for a remux (e.g. a clean audio feed).",
+    remux: "Video taken from one input + audio from another, sent to platforms, with a backup video.",
+  };
+  function updateCreateTypeDesc() {
+    els.pcreateTypeDesc.textContent = CREATE_TYPE_DESC[els.pcreateType.value] || "";
+  }
+  function openCreateModal() {
+    els.pcreateType.value = "restream";
+    els.pcreateName.value = "";
+    updateCreateTypeDesc();
+    els.pcreateErrors.hidden = true;
+    els.pcreateModal.hidden = false;
+    els.pcreateName.focus();
+  }
+  function closeCreateModal() { els.pcreateModal.hidden = true; }
+  function submitCreate() {
+    els.pcreateErrors.hidden = true;
+    const type = els.pcreateType.value;
+    const name = els.pcreateName.value.trim();
+    if (!name) { showErrorsInto(els.pcreateErrors, { name: "name is required" }); return; }
+    // Remember the name so its edit widget opens automatically on success.
+    pendingEditName = name;
+    if (type === "input") send({ command: "add_input_pipeline", name });
+    else if (type === "remux") send({ command: "add_remux_pipeline", name });
+    else send({ command: "add_pipeline", name });
+  }
+
+  // Once the settings refresh that follows a successful create arrives, open the
+  // freshly created pipeline's edit widget so it can be configured.
+  function maybeOpenPendingEdit() {
+    if (!pendingEditName || !settingsData) return;
+    const p = (settingsData.pipelines || []).find((x) => x.name === pendingEditName);
+    pendingEditName = null;
+    if (p) openPipelineModal("edit", p);
   }
   function showPipelineModalErrors(errors) {
     els.pmodalErrors.innerHTML = "";
@@ -832,10 +1058,27 @@
   els.modal.addEventListener("click", (e) => { if (e.target === els.modal) closePlatformModal(); });
 
   els.pmodalIngestShow.addEventListener("click", () => { pmodalIngestShown = !pmodalIngestShown; renderModalIngest(); });
+  // Audio trim applies live (set once by eye while watching the stream) --
+  // independent of the OK button, which saves name/backup/sources.
+  els.pmodalTrim.addEventListener("change", () => {
+    if (pmodalMode !== "edit" || pmodalType !== "remux" || !pmodalEditingName) return;
+    let v = Math.round(Number(els.pmodalTrim.value) || 0);
+    v = Math.max(-2000, Math.min(2000, v));
+    els.pmodalTrim.value = v;
+    send({ command: "set_audio_trim", pipeline: pmodalEditingName, audio_trim_ms: v });
+  });
   els.pmodalOk.addEventListener("click", submitPipelineModal);
   els.pmodalCancel.addEventListener("click", closePipelineModal);
   els.pmodal.addEventListener("click", (e) => { if (e.target === els.pmodal) closePipelineModal(); });
-  els.btnAddPipeline.addEventListener("click", () => openPipelineModal("add", null));
+
+  // "Add pipeline" -> create widget (type + name). OK creates it, then its
+  // edit widget opens automatically (maybeOpenPendingEdit) to configure the rest.
+  els.btnAddPipeline.addEventListener("click", openCreateModal);
+  els.pcreateType.addEventListener("change", updateCreateTypeDesc);
+  els.pcreateOk.addEventListener("click", submitCreate);
+  els.pcreateCancel.addEventListener("click", closeCreateModal);
+  els.pcreateModal.addEventListener("click", (e) => { if (e.target === els.pcreateModal) closeCreateModal(); });
+  els.pcreateName.addEventListener("keydown", (e) => { if (e.key === "Enter") submitCreate(); });
 
   els.btnApply.addEventListener("click", saveSettings);
 

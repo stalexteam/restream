@@ -263,10 +263,16 @@ def make_handler(manager, config: dict, hub, config_path: Path):
                     self._handle_get_settings(write_lock)
             elif command == "add_pipeline":
                 self._handle_add_pipeline(message, write_lock)
+            elif command == "add_input_pipeline":
+                self._handle_add_input_pipeline(message, write_lock)
+            elif command == "add_remux_pipeline":
+                self._handle_add_remux_pipeline(message, write_lock)
             elif command == "update_pipeline":
                 self._handle_update_pipeline(message, write_lock)
             elif command == "remove_pipeline":
                 self._handle_remove_pipeline(message, write_lock)
+            elif command == "set_audio_trim":
+                self._handle_set_audio_trim(message, write_lock)
             else:
                 logging.warning("dashboard: unknown /ws command: %r", command)
 
@@ -290,18 +296,42 @@ def make_handler(manager, config: dict, hub, config_path: Path):
             # Глобальні System-поля (offline/connect/read/icmp) + вкладена
             # структура пайплайнів (кожен зі своїм backup, авто-призначеним
             # ingest-шляхом + готовим OBS-ключем, і списком площадок).
+            # `source_candidates` -- джерела для дропдаунів модалки remux.
             data = settings_store.load_editable(config_path)
             data["pipelines"] = manager.pipelines_for_settings()
+            data["source_candidates"] = manager.source_candidates()
             ws.send_text(self, json.dumps({"type": "settings", "data": data}), write_lock)
 
+        # Створення пайплайна -- потік «тип+імʼя -> OK -> авто-редагування»:
+        # на створенні перевіряємо ЛИШЕ імʼя, решту полів (backup/джерела)
+        # задають уже у віджеті редагування, що відкривається автоматично.
         def _handle_add_pipeline(self, message: dict, write_lock):
             name = (message.get("name") or "").strip()
-            backup = (message.get("backup_file") or "").strip()
-            errors = settings_store.validate_pipeline(name, backup, manager.pipeline_names(), manager.base_dir)
+            errors = settings_store.validate_pipeline_name(name, manager.pipeline_names())
             if errors:
                 self._reply_pipeline(False, errors, write_lock)
                 return
-            manager.add_pipeline(name, backup)  # ingest-шлях призначається автоматично
+            manager.add_pipeline(name, "")  # backup задається в редагуванні
+            self._reply_pipeline(True, {}, write_lock)
+            self._handle_get_settings(write_lock)
+
+        def _handle_add_input_pipeline(self, message: dict, write_lock):
+            name = (message.get("name") or "").strip()
+            errors = settings_store.validate_pipeline_name(name, manager.pipeline_names())
+            if errors:
+                self._reply_pipeline(False, errors, write_lock)
+                return
+            manager.add_input_pipeline(name)
+            self._reply_pipeline(True, {}, write_lock)
+            self._handle_get_settings(write_lock)
+
+        def _handle_add_remux_pipeline(self, message: dict, write_lock):
+            name = (message.get("name") or "").strip()
+            errors = settings_store.validate_pipeline_name(name, manager.pipeline_names())
+            if errors:
+                self._reply_pipeline(False, errors, write_lock)
+                return
+            manager.add_remux_pipeline(name, "", "", "")  # джерела/backup -- у редагуванні
             self._reply_pipeline(True, {}, write_lock)
             self._handle_get_settings(write_lock)
 
@@ -313,18 +343,58 @@ def make_handler(manager, config: dict, hub, config_path: Path):
                 self._reply_pipeline(False, {"_": "unknown pipeline"}, write_lock)
                 return
             names = [n for n in manager.pipeline_names() if n != old]  # rename на будь-яке вільне
-            errors = settings_store.validate_pipeline(new_name, backup, names, manager.base_dir)
-            if errors:
-                self._reply_pipeline(False, errors, write_lock)
-                return
-            manager.update_pipeline(old, new_name, backup)
+            ptype = manager.pipeline_type(old)
+            # Повна валідація за типом (тут, у редагуванні, поля вже введені):
+            # input -- лише ім'я; restream -- ім'я+backup; remux -- +джерела.
+            if ptype == "input":
+                errors = settings_store.validate_input_pipeline(new_name, names)
+                if errors:
+                    self._reply_pipeline(False, errors, write_lock)
+                    return
+                manager.update_pipeline(old, new_name, backup)
+            elif ptype == "remux":
+                video_src = (message.get("video_src_path") or "").strip()
+                audio_src = (message.get("audio_src_path") or "").strip()
+                errors = settings_store.validate_remux_pipeline(
+                    new_name, video_src, audio_src, backup, names, manager.base_dir,
+                    manager.source_candidates())
+                if errors:
+                    self._reply_pipeline(False, errors, write_lock)
+                    return
+                manager.update_pipeline(old, new_name, backup, video_src, audio_src)
+            else:
+                errors = settings_store.validate_pipeline(new_name, backup, names, manager.base_dir)
+                if errors:
+                    self._reply_pipeline(False, errors, write_lock)
+                    return
+                manager.update_pipeline(old, new_name, backup)
             self._reply_pipeline(True, {}, write_lock)
             self._handle_get_settings(write_lock)
 
         def _handle_remove_pipeline(self, message: dict, write_lock):
             name = message.get("name")
             if isinstance(name, str):
+                # Заборона видалення джерела з-під живого remux (§4.4): чіткий
+                # toast із переліком remux, що на нього посилаються.
+                blocking = manager.blocking_remux_for(name)
+                if blocking:
+                    self._reply_pipeline(
+                        False,
+                        {"_": f"cannot remove: used as a source by remux pipeline(s): {', '.join(blocking)}"},
+                        write_lock,
+                    )
+                    return
                 manager.remove_pipeline(name)
+            self._handle_get_settings(write_lock)
+
+        def _handle_set_audio_trim(self, message: dict, write_lock):
+            pipeline = self._pipeline_of(message)
+            trim = message.get("audio_trim_ms")
+            if pipeline is None or not isinstance(trim, (int, float)) or isinstance(trim, bool):
+                self._reply_pipeline(False, {"_": "audio_trim_ms must be a number and a pipeline given"}, write_lock)
+                return
+            manager.set_audio_trim(pipeline, int(trim))
+            self._reply_pipeline(True, {}, write_lock)
             self._handle_get_settings(write_lock)
 
         def _handle_add_output(self, message: dict, write_lock):

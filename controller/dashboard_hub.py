@@ -158,8 +158,13 @@ class DashboardHub:
         # кладемо в загальну мапу компонентів під ключем "<роль>:<пайплайн>".
         for pipeline in status.get("pipelines", []):
             name = pipeline.get("name", "?")
-            components[f"relay:{name}"] = self._component(pipeline.pop("relay_pid", None))
-            components[f"backup:{name}"] = self._component(pipeline.pop("backup_pid", None))
+            # Компоненти додаємо лише для тих ролей, що реально існують у
+            # пайплайна цього типу: restream -- relay+backup; remux -- backup
+            # (relay зʼявиться у Фазі 2); input -- жодного (немає ключів).
+            if "relay_pid" in pipeline:
+                components[f"relay:{name}"] = self._component(pipeline.pop("relay_pid"))
+            if "backup_pid" in pipeline:
+                components[f"backup:{name}"] = self._component(pipeline.pop("backup_pid"))
             for dest in pipeline.get("destinations", []):
                 pid = dest.get("pid")
                 running = pid is not None and self._pid_alive(pid)
